@@ -231,7 +231,7 @@ typedef void (*qdr_general_work_handler_t) (qdr_core_t *core, qdr_general_work_t
 struct qdr_general_work_t {
     DEQ_LINKS(qdr_general_work_t);
     qdr_general_work_handler_t   handler;
-    qdr_field_t                 *field;
+    char                        *field;
     int                          maskbit;
     int                          inter_router_cost;
     qd_message_t                *msg;
