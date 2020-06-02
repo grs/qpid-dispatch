@@ -1472,6 +1472,13 @@ qd_message_t *qd_message_receive(pn_delivery_t *delivery)
     return (qd_message_t*) msg;
 }
 
+void qd_message_stream_append(qd_message_t* msg, qd_buffer_list_t *buffers)
+{
+    qd_message_content_t *content = MSG_CONTENT(msg);
+    LOCK(content->lock);
+    DEQ_APPEND(content->buffers, *buffers);
+    UNLOCK(content->lock);
+}
 
 static void send_handler(void *context, const unsigned char *start, int length)
 {
@@ -1600,6 +1607,21 @@ static void compose_message_annotations(qd_message_pvt_t *msg, qd_buffer_list_t 
     } else {
         compose_message_annotations_v1(msg, out, out_trailer);
     }
+}
+
+size_t qd_message_get_body_data(qd_message_t *msg, pn_raw_buffer_t* buffers, size_t length)
+{
+    qd_message_content_t *content = MSG_CONTENT(msg);
+    qd_buffer_t          *buf     = DEQ_HEAD(content->buffers);
+    size_t count;
+    for (count = 0; count < length && buf; count++) {
+        buffers[count].bytes = (char*) qd_buffer_base(buf);
+        buffers[count].capacity = qd_buffer_size(buf);
+        buffers[count].size = qd_buffer_size(buf);
+        buffers[count].offset = 0;
+        buf = DEQ_NEXT(buf);
+    }
+    return count;
 }
 
 
@@ -2196,6 +2218,54 @@ void qd_message_compose_4(qd_message_t *msg, qd_composed_field_t *field1, qd_com
     DEQ_APPEND(content->buffers, (*field3_buffers));
 }
 
+void qd_message_compose_stream(qd_message_t *msg, const char *to, const char *reply_to, qd_buffer_list_t *buffers)
+{
+    qd_composed_field_t  *field   = qd_compose(QD_PERFORMATIVE_HEADER, 0);
+    qd_message_content_t *content = MSG_CONTENT(msg);
+    content->receive_complete     = false;
+
+    qd_compose_start_list(field);
+    qd_compose_insert_bool(field, 0);     // durable
+    qd_compose_insert_null(field);        // priority
+    //qd_compose_insert_null(field);        // ttl
+    //qd_compose_insert_boolean(field, 0);  // first-acquirer
+    //qd_compose_insert_uint(field, 0);     // delivery-count
+    qd_compose_end_list(field);
+
+    qd_buffer_list_t out_ma;
+    qd_buffer_list_t out_ma_trailer;
+    DEQ_INIT(out_ma);
+    DEQ_INIT(out_ma_trailer);
+    compose_message_annotations((qd_message_pvt_t*)msg, &out_ma, &out_ma_trailer, false);
+    qd_compose_insert_buffers(field, &out_ma);
+    // TODO: user annotation blob goes here
+    qd_compose_insert_buffers(field, &out_ma_trailer);
+
+    field = qd_compose(QD_PERFORMATIVE_PROPERTIES, field);
+    qd_compose_start_list(field);
+    qd_compose_insert_null(field);          // message-id
+    qd_compose_insert_null(field);          // user-id
+    qd_compose_insert_string(field, to);    // to
+    qd_compose_insert_null(field);          // subject
+    qd_compose_insert_string(field, reply_to); // reply-to
+    //qd_compose_insert_null(field);          // correlation-id
+    //qd_compose_insert_null(field);          // content-type
+    //qd_compose_insert_null(field);          // content-encoding
+    //qd_compose_insert_timestamp(field, 0);  // absolute-expiry-time
+    //qd_compose_insert_timestamp(field, 0);  // creation-time
+    //qd_compose_insert_null(field);          // group-id
+    //qd_compose_insert_uint(field, 0);       // group-sequence
+    //qd_compose_insert_null(field);          // reply-to-group-id
+    qd_compose_end_list(field);
+
+    if (buffers) {
+        field = qd_compose(QD_PERFORMATIVE_BODY_DATA, field);
+        qd_compose_insert_binary_buffers(field, buffers);
+    }
+
+    qd_compose_take_buffers(field, &content->buffers);
+    qd_compose_free(field);
+}
 
 void qd_message_compose_5(qd_message_t        *msg,
                           qd_composed_field_t *headers,
