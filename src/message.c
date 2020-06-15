@@ -1472,14 +1472,6 @@ qd_message_t *qd_message_receive(pn_delivery_t *delivery)
     return (qd_message_t*) msg;
 }
 
-void qd_message_stream_append(qd_message_t* msg, qd_buffer_list_t *buffers)
-{
-    qd_message_content_t *content = MSG_CONTENT(msg);
-    LOCK(content->lock);
-    DEQ_APPEND(content->buffers, *buffers);
-    UNLOCK(content->lock);
-}
-
 static void send_handler(void *context, const unsigned char *start, int length)
 {
     pn_link_t *pnl = (pn_link_t*) context;
@@ -2286,6 +2278,10 @@ void qd_message_compose_5(qd_message_t        *msg,
     content->receive_complete = complete;
 }
 
+void qd_message_release_body(qd_message_t *msg, pn_raw_buffer_t *buffers, int buffer_count)
+{
+    //TODO
+}
 
 int qd_message_extend(qd_message_t *msg, qd_buffer_list_t *buffers)
 {
