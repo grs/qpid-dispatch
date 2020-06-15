@@ -161,71 +161,6 @@ static void free_qdr_tcp_connection(qdr_tcp_connection_t* tc)
     free(tc);
 }
 
-static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void *context)
-{
-    qdr_tcp_connection_t *conn = (qdr_tcp_connection_t*) context;
-    qd_log_source_t *log = tcp_adaptor->log_source;
-    switch (pn_event_type(e)) {
-    case PN_RAW_CONNECTION_CONNECTED: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Connected", conn->conn_id);
-        while (qdr_connection_process(conn->conn)) {}
-        break;
-    }
-    case PN_RAW_CONNECTION_CLOSED_READ: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Closed for reading", conn->conn_id);
-        break;
-    }
-    case PN_RAW_CONNECTION_CLOSED_WRITE: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Closed for writing", conn->conn_id);
-        break;
-    }
-    case PN_RAW_CONNECTION_DISCONNECTED: {
-        qdr_connection_closed(conn->conn);
-        free_qdr_tcp_connection(conn);
-        qd_log(log, QD_LOG_INFO, "[C%i] Disconnected", conn->conn_id);
-        break;
-    }
-    case PN_RAW_CONNECTION_NEED_WRITE_BUFFERS: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Need write buffers", conn->conn_id);
-        while (qdr_connection_process(conn->conn)) {}
-        break;
-    }
-    case PN_RAW_CONNECTION_NEED_READ_BUFFERS: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Need read buffers", conn->conn_id);
-        while (qdr_connection_process(conn->conn)) {}
-        break;
-    }
-    case PN_RAW_CONNECTION_WAKE: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Wake-up", conn->conn_id);
-        while (qdr_connection_process(conn->conn)) {}
-        break;
-    }
-    case PN_RAW_CONNECTION_READ: {
-        int read = handle_incoming(conn);
-        qd_log(log, QD_LOG_INFO, "[C%i] Read %i bytes", conn->conn_id, read);
-        while (qdr_connection_process(conn->conn)) {}
-        break;
-    }
-    case PN_RAW_CONNECTION_WRITTEN: {
-        pn_raw_buffer_t buffs[WRITE_BUFFERS];
-        size_t pn_raw_connection_take_written_buffers(pn_raw_connection_t *connection, pn_raw_buffer_t *buffers, size_t num);
-        size_t n;
-        size_t written = 0;
-        while ( (n = pn_raw_connection_take_written_buffers(conn->socket, buffs, WRITE_BUFFERS)) ) {
-            for (size_t i = 0; i < n; ++i) {
-                written += buffs[i].size;
-            }
-            qd_message_release_body(qdr_delivery_message(conn->outstream), buffs, n);
-        }
-        qd_log(log, QD_LOG_INFO, "[C%i] Wrote %i bytes", conn->conn_id, written);
-        while (qdr_connection_process(conn->conn)) {}
-        break;
-    }
-    default:
-        break;
-    }
-}
-
 static char *get_address_string(pn_raw_connection_t *socket)
 {
     const pn_netaddr_t *netaddr = pn_raw_connection_remote_addr(socket);
@@ -238,18 +173,8 @@ static char *get_address_string(pn_raw_connection_t *socket)
     }
 }
 
-static qdr_tcp_connection_t *qdr_tcp_connection_ingress(qd_tcp_listener_t* listener)
+static void qdr_tcp_connection_ingress_accept(qdr_tcp_connection_t* tc)
 {
-    qdr_tcp_connection_t* tc = NEW(qdr_tcp_connection_t);
-    ZERO(tc);
-    tc->ingress = true;
-    tc->context.context = tc;
-    tc->context.handler = &handle_connection_event;
-    tc->config = &(listener->config);
-    tc->server = listener->server;
-    tc->socket = pn_raw_connection();
-    pn_raw_connection_set_context(tc->socket, tc);
-    pn_listener_raw_accept(listener->pn_listener, tc->socket);
     tc->remote_address = get_address_string(tc->socket);
     qdr_connection_info_t *info = qdr_connection_info(false, //bool             is_encrypted,
                                                       false, //bool             is_authenticated,
@@ -311,7 +236,94 @@ static qdr_tcp_connection_t *qdr_tcp_connection_ingress(qd_tcp_listener_t* liste
     qdr_link_set_context(tc->incoming, tc);
 
     grant_read_buffers(tc);
+}
 
+static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void *context)
+{
+    qdr_tcp_connection_t *conn = (qdr_tcp_connection_t*) context;
+    qd_log_source_t *log = tcp_adaptor->log_source;
+    switch (pn_event_type(e)) {
+    case PN_RAW_CONNECTION_CONNECTED: {
+        if (conn->ingress) {
+            qdr_tcp_connection_ingress_accept(conn);
+            qd_log(log, QD_LOG_INFO, "[C%i] Accepted from %s", conn->conn_id, conn->remote_address);
+        } else {
+            qd_log(log, QD_LOG_INFO, "[C%i] Connected", conn->conn_id);
+            qdr_connection_process(conn->conn);
+            break;
+        }
+    }
+    case PN_RAW_CONNECTION_CLOSED_READ: {
+        qd_log(log, QD_LOG_INFO, "[C%i] Closed for reading", conn->conn_id);
+        break;
+    }
+    case PN_RAW_CONNECTION_CLOSED_WRITE: {
+        qd_log(log, QD_LOG_INFO, "[C%i] Closed for writing", conn->conn_id);
+        break;
+    }
+    case PN_RAW_CONNECTION_DISCONNECTED: {
+        qdr_connection_closed(conn->conn);
+        free_qdr_tcp_connection(conn);
+        qd_log(log, QD_LOG_INFO, "[C%i] Disconnected", conn->conn_id);
+        break;
+    }
+    case PN_RAW_CONNECTION_NEED_WRITE_BUFFERS: {
+        qd_log(log, QD_LOG_INFO, "[C%i] Need write buffers", conn->conn_id);
+        while (qdr_connection_process(conn->conn)) {}
+        break;
+    }
+    case PN_RAW_CONNECTION_NEED_READ_BUFFERS: {
+        qd_log(log, QD_LOG_INFO, "[C%i] Need read buffers", conn->conn_id);
+        while (qdr_connection_process(conn->conn)) {}
+        break;
+    }
+    case PN_RAW_CONNECTION_WAKE: {
+        qd_log(log, QD_LOG_INFO, "[C%i] Wake-up", conn->conn_id);
+        while (qdr_connection_process(conn->conn)) {}
+        break;
+    }
+    case PN_RAW_CONNECTION_READ: {
+        int read = handle_incoming(conn);
+        qd_log(log, QD_LOG_INFO, "[C%i] Read %i bytes", conn->conn_id, read);
+        while (qdr_connection_process(conn->conn)) {}
+        break;
+    }
+    case PN_RAW_CONNECTION_WRITTEN: {
+        pn_raw_buffer_t buffs[WRITE_BUFFERS];
+        size_t pn_raw_connection_take_written_buffers(pn_raw_connection_t *connection, pn_raw_buffer_t *buffers, size_t num);
+        size_t n;
+        size_t written = 0;
+        while ( (n = pn_raw_connection_take_written_buffers(conn->socket, buffs, WRITE_BUFFERS)) ) {
+            for (size_t i = 0; i < n; ++i) {
+                written += buffs[i].size;
+            }
+            qd_message_release_body(qdr_delivery_message(conn->outstream), buffs, n);
+        }
+        qd_log(log, QD_LOG_INFO, "[C%i] Wrote %i bytes", conn->conn_id, written);
+        while (qdr_connection_process(conn->conn)) {}
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static qdr_tcp_connection_t *qdr_tcp_connection_ingress(qd_tcp_listener_t* listener)
+{
+    qdr_tcp_connection_t* tc = NEW(qdr_tcp_connection_t);
+    ZERO(tc);
+    tc->ingress = true;
+    tc->context.context = tc;
+    tc->context.handler = &handle_connection_event;
+    tc->config = &(listener->config);
+    tc->server = listener->server;
+    tc->socket = pn_raw_connection();
+    pn_raw_connection_set_context(tc->socket, tc);
+    //the following call will cause a PN_RAW_CONNECTION_CONNECTED
+    //event on another thread, which is where the rest of the
+    //initialisation will happen, through a call to
+    //qdr_tcp_connection_ingress_accept
+    pn_listener_raw_accept(listener->pn_listener, tc->socket);
     return tc;
 }
 
