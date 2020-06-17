@@ -119,31 +119,40 @@ static int handle_incoming(qdr_tcp_connection_t *conn)
     } else {
         qd_message_t *msg = qd_message();
         qd_message_compose_stream(msg, conn->config->address, conn->reply_to, &buffers);
+
+        /*
+        qd_composed_field_t *props = qd_compose(QD_PERFORMATIVE_PROPERTIES, 0);
+        qd_compose_start_list(props);
+        qd_compose_insert_null(props);                      // message-id
+        qd_compose_insert_null(props);                      // user-id
+        qd_compose_insert_null(props);                      // to
+        qd_compose_insert_null(props);                      // subject
+        qd_compose_insert_string(props, conn->reply_to);    // reply-to
+        //qd_compose_insert_null(props);                      // correlation-id
+        //qd_compose_insert_null(props);                      // content-type
+        //qd_compose_insert_null(props);                      // content-encoding
+        //qd_compose_insert_timestamp(props, 0);              // absolute-expiry-time
+        //qd_compose_insert_timestamp(props, 0);              // creation-time
+        //qd_compose_insert_null(props);                      // group-id
+        //qd_compose_insert_uint(props, 0);                   // group-sequence
+        //qd_compose_insert_null(props);                      // reply-to-group-id
+        qd_compose_end_list(props);
+
+        qd_message_compose_5(msg, props, &buffers, true);
+        qd_compose_free(props);
+        */
+
         conn->instream = qdr_link_deliver(conn->incoming, msg, 0, false, 0, 0);
         qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i][L%i] Initiating message with %i bytes", conn->conn_id, conn->incoming_id, count);
     }
     return count;
 }
 
-static void handle_outgoing(qdr_tcp_connection_t *conn)
+static void socket_closed(qdr_tcp_connection_t* tc)
 {
-    if (conn->outstream) {
-        qd_message_t *msg = qdr_delivery_message(conn->outstream);
-        pn_raw_buffer_t buffs[WRITE_BUFFERS];
-        //populate the raw buffers from message buffers but only want the body
-        //need to track where we got to
-        size_t n = qd_message_get_body_data(msg, buffs, WRITE_BUFFERS);
-        size_t used = pn_raw_connection_write_buffers(conn->socket, buffs, n);
-        int bytes_written = 0;
-        for (size_t i = 0; i < used; i++) {
-            if (buffs[i].bytes) {
-                bytes_written += buffs[i].size;
-            } else {
-                qd_log(tcp_adaptor->log_source, QD_LOG_ERROR, "[C%i] empty buffer can't be written", conn->conn_id);
-            }
-        }
-        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Writing %i bytes", conn->conn_id, bytes_written);
-    }
+    qd_message_set_receive_complete(qdr_delivery_message(tc->instream));
+    qdr_delivery_continue(tcp_adaptor->core, tc->instream, true);
+    pn_raw_connection_close(tc->socket);
 }
 
 static void free_qdr_tcp_connection(qdr_tcp_connection_t* tc)
@@ -159,6 +168,49 @@ static void free_qdr_tcp_connection(qdr_tcp_connection_t* tc)
     }
     //assume proactor will free the socket
     free(tc);
+}
+
+static void handle_disconnected(qdr_tcp_connection_t* conn)
+{
+    if (conn->ingress) {
+        qdr_connection_closed(conn->conn);
+        free_qdr_tcp_connection(conn);
+    } else {
+        // for egress, need to keep the connection and outgoing link
+        // open to receive further connection requests
+        qdr_link_detach(conn->incoming, QD_CLOSED, NULL);
+        qdr_delivery_continue(tcp_adaptor->core, conn->outstream, true);
+        //reset any state tied to specific connection:
+        free(conn->reply_to);
+        conn->reply_to = NULL;
+        conn->instream = NULL;
+        conn->outstream = NULL;
+        conn->socket = NULL;
+    }
+}
+
+static void handle_outgoing(qdr_tcp_connection_t *conn)
+{
+    if (conn->outstream) {
+        qd_message_t *msg = qdr_delivery_message(conn->outstream);
+        pn_raw_buffer_t buffs[WRITE_BUFFERS];
+        //populate the raw buffers from message buffers but only want the body
+        //need to track where we got to
+        int n = qd_message_read_body(msg, buffs, WRITE_BUFFERS);
+        size_t used = pn_raw_connection_write_buffers(conn->socket, buffs, n);
+        int bytes_written = 0;
+        for (size_t i = 0; i < used; i++) {
+            if (buffs[i].bytes) {
+                bytes_written += buffs[i].size;
+            } else {
+                qd_log(tcp_adaptor->log_source, QD_LOG_ERROR, "[C%i] empty buffer can't be written", conn->conn_id);
+            }
+        }
+        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Writing %i bytes", conn->conn_id, bytes_written);
+        if (qd_message_receive_complete(msg)) {
+            socket_closed(conn);
+        }
+    }
 }
 
 static char *get_address_string(pn_raw_connection_t *socket)
@@ -247,6 +299,7 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
         if (conn->ingress) {
             qdr_tcp_connection_ingress_accept(conn);
             qd_log(log, QD_LOG_INFO, "[C%i] Accepted from %s", conn->conn_id, conn->remote_address);
+            break;
         } else {
             qd_log(log, QD_LOG_INFO, "[C%i] Connected", conn->conn_id);
             qdr_connection_process(conn->conn);
@@ -255,15 +308,16 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
     }
     case PN_RAW_CONNECTION_CLOSED_READ: {
         qd_log(log, QD_LOG_INFO, "[C%i] Closed for reading", conn->conn_id);
+        socket_closed(conn);
         break;
     }
     case PN_RAW_CONNECTION_CLOSED_WRITE: {
         qd_log(log, QD_LOG_INFO, "[C%i] Closed for writing", conn->conn_id);
+        socket_closed(conn);
         break;
     }
     case PN_RAW_CONNECTION_DISCONNECTED: {
-        qdr_connection_closed(conn->conn);
-        free_qdr_tcp_connection(conn);
+        handle_disconnected(conn);
         qd_log(log, QD_LOG_INFO, "[C%i] Disconnected", conn->conn_id);
         break;
     }

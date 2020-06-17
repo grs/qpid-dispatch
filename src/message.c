@@ -1601,17 +1601,57 @@ static void compose_message_annotations(qd_message_pvt_t *msg, qd_buffer_list_t 
     }
 }
 
-size_t qd_message_get_body_data(qd_message_t *msg, pn_raw_buffer_t* buffers, size_t length)
+
+int qd_message_read_body(qd_message_t *in_msg, pn_raw_buffer_t* buffers, int length)
 {
-    qd_message_content_t *content = MSG_CONTENT(msg);
-    qd_buffer_t          *buf     = DEQ_HEAD(content->buffers);
-    size_t count;
+    qd_message_pvt_t     *msg     = (qd_message_pvt_t*) in_msg;
+    if (!(msg->cursor.buffer && msg->cursor.cursor)) {
+        qd_field_location_t  *loc     = qd_message_field_location(in_msg, QD_FIELD_BODY);
+        if (!loc || loc->tag == QD_AMQP_NULL)
+            return 0;
+        // TODO: need to actually determine this, could be different if vbin32 sent
+        int preamble = 5;
+        if (loc->offset + preamble < qd_buffer_size(loc->buffer)) {
+            msg->cursor.buffer = loc->buffer;
+            msg->cursor.cursor = qd_buffer_base(loc->buffer) + loc->offset + preamble;
+        } else {
+            msg->cursor.buffer = DEQ_NEXT(loc->buffer);
+            if (!msg->cursor.buffer) return 0;
+            msg->cursor.cursor = qd_buffer_base(msg->cursor.buffer) + ((loc->offset + preamble) - qd_buffer_size(loc->buffer));
+        }
+    }
+
+    qd_buffer_t   *buf    = msg->cursor.buffer;
+    unsigned char *cursor = msg->cursor.cursor;
+
+    // if we are at the end of the current buffer, try to move to the
+    // next buffer
+    if (cursor == qd_buffer_base(buf) + qd_buffer_size(buf)) {
+        buf = DEQ_NEXT(buf);
+        if (buf) {
+            cursor = qd_buffer_base(buf);
+            msg->cursor.buffer = buf;
+            msg->cursor.cursor = cursor;
+        } else {
+            return 0;
+        }
+    }
+
+    int count;
     for (count = 0; count < length && buf; count++) {
         buffers[count].bytes = (char*) qd_buffer_base(buf);
         buffers[count].capacity = qd_buffer_size(buf);
         buffers[count].size = qd_buffer_size(buf);
-        buffers[count].offset = 0;
+        buffers[count].offset = cursor - qd_buffer_base(buf);
+        buffers[count].context = (uintptr_t) buf;
         buf = DEQ_NEXT(buf);
+        if (buf) {
+            cursor = qd_buffer_base(buf);
+            msg->cursor.buffer = buf;
+            msg->cursor.cursor = cursor;
+        } else {
+            msg->cursor.cursor = qd_buffer_base(msg->cursor.buffer) + qd_buffer_size(msg->cursor.buffer);
+        }
     }
     return count;
 }
@@ -2210,6 +2250,25 @@ void qd_message_compose_4(qd_message_t *msg, qd_composed_field_t *field1, qd_com
     DEQ_APPEND(content->buffers, (*field3_buffers));
 }
 
+void qd_message_compose_5(qd_message_t        *msg,
+                          qd_composed_field_t *headers,
+                          qd_buffer_list_t    *body,
+                          bool                 complete)
+{
+    qd_message_content_t *content         = MSG_CONTENT(msg);
+    qd_buffer_list_t     *headers_buffers = headers ? qd_compose_buffers(headers) : 0;
+
+    DEQ_INIT(content->buffers);
+    if (headers_buffers)
+        DEQ_APPEND(content->buffers, (*headers_buffers));
+
+    if (body) {
+        DEQ_APPEND(content->buffers, (*body));
+    }
+
+    content->receive_complete = complete;
+}
+
 void qd_message_compose_stream(qd_message_t *msg, const char *to, const char *reply_to, qd_buffer_list_t *buffers)
 {
     qd_composed_field_t  *field   = qd_compose(QD_PERFORMATIVE_HEADER, 0);
@@ -2257,25 +2316,6 @@ void qd_message_compose_stream(qd_message_t *msg, const char *to, const char *re
 
     qd_compose_take_buffers(field, &content->buffers);
     qd_compose_free(field);
-}
-
-void qd_message_compose_5(qd_message_t        *msg,
-                          qd_composed_field_t *headers,
-                          qd_buffer_list_t    *body,
-                          bool                 complete)
-{
-    qd_message_content_t *content         = MSG_CONTENT(msg);
-    qd_buffer_list_t     *headers_buffers = headers ? qd_compose_buffers(headers) : 0;
-
-    DEQ_INIT(content->buffers);
-    if (headers_buffers)
-        DEQ_APPEND(content->buffers, (*headers_buffers));
-
-    if (body) {
-        DEQ_APPEND(content->buffers, (*body));
-    }
-
-    content->receive_complete = complete;
 }
 
 void qd_message_release_body(qd_message_t *msg, pn_raw_buffer_t *buffers, int buffer_count)
