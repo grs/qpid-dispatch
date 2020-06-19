@@ -1160,6 +1160,7 @@
                         "CONN_MGR",
                         "PYTHON",
                         "PROTOCOL",
+                        "TCP_ADAPTOR",
                         "DEFAULT"
                     ],
                     "required": true,
