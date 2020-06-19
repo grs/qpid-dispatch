@@ -55,7 +55,6 @@ struct qd_tcp_listener_t
     qd_server_t              *server;
     qd_bridge_config_t        config;
     pn_listener_t            *pn_listener;
-    qd_http_listener_t       *http;
 
     DEQ_LINKS(qd_tcp_listener_t);
 };
@@ -69,8 +68,7 @@ struct qd_tcp_connector_t
     sys_atomic_t              ref_count;
     qd_server_t              *server;
     qd_bridge_config_t        config;
-    qd_timer_t               *timer;
-    long                      delay;
+    void                     *dispatcher;
 
     DEQ_LINKS(qd_tcp_connector_t);
 };

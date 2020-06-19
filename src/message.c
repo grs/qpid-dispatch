@@ -1609,15 +1609,32 @@ int qd_message_read_body(qd_message_t *in_msg, pn_raw_buffer_t* buffers, int len
         qd_field_location_t  *loc     = qd_message_field_location(in_msg, QD_FIELD_BODY);
         if (!loc || loc->tag == QD_AMQP_NULL)
             return 0;
-        // TODO: need to actually determine this, could be different if vbin32 sent
-        int preamble = 5;
-        if (loc->offset + preamble < qd_buffer_size(loc->buffer)) {
+        int preamble = 0;
+        unsigned char typecode;
+        int typecode_offset = loc->offset + loc->hdr_length;
+        if (typecode_offset < qd_buffer_size(loc->buffer)) {
+            typecode = *qd_buffer_at(loc->buffer, typecode_offset);
+        } else {
+            typecode = *qd_buffer_at(DEQ_NEXT(loc->buffer), typecode_offset - qd_buffer_size(loc->buffer));
+        }
+        if (typecode == QD_AMQP_VBIN8) {
+            preamble = 2;//typecode + one byte length indicator
+        } else if (typecode == QD_AMQP_VBIN32) {
+            preamble = 5;//typecode + four byte length indicator
+        } else {
+            qd_error(QD_ERROR_MESSAGE, "Unexpected typecode for data: %c", typecode);
+            if (typecode >> 4 == 0xA) preamble = 2;
+            else if (typecode >> 4 == 0xB) preamble = 4;
+        }
+
+        int data_offset = loc->offset + loc->hdr_length + preamble;
+        if (data_offset < qd_buffer_size(loc->buffer)) {
             msg->cursor.buffer = loc->buffer;
-            msg->cursor.cursor = qd_buffer_base(loc->buffer) + loc->offset + preamble;
+            msg->cursor.cursor = qd_buffer_base(loc->buffer) + data_offset;
         } else {
             msg->cursor.buffer = DEQ_NEXT(loc->buffer);
             if (!msg->cursor.buffer) return 0;
-            msg->cursor.cursor = qd_buffer_base(msg->cursor.buffer) + ((loc->offset + preamble) - qd_buffer_size(loc->buffer));
+            msg->cursor.cursor = qd_buffer_base(msg->cursor.buffer) + ((data_offset) - qd_buffer_size(loc->buffer));
         }
     }
 

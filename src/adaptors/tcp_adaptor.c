@@ -58,18 +58,25 @@ typedef struct qdr_tcp_connection_t {
     qdr_delivery_t       *instream;
     qdr_delivery_t       *outstream;
     bool                  ingress;
+    bool                  egress_dispatcher;
+    bool                  connector_closed;//only used if egress_dispatcher=true
     qd_timer_t           *activate_timer;
-    qd_bridge_config_t   *config;
+    qd_bridge_config_t   config;
     qd_server_t          *server;
     char                 *remote_address;
 } qdr_tcp_connection_t;
+
+static void handle_disconnected(qdr_tcp_connection_t* conn);
 
 static void on_activate(void *context)
 {
     qdr_tcp_connection_t* conn = (qdr_tcp_connection_t*) context;
 
-    qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] on_activate", conn->conn_id);
+    qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%i] on_activate", conn->conn_id);
     while (qdr_connection_process(conn->conn)) {}
+    if (conn->egress_dispatcher && conn->connector_closed) {
+        handle_disconnected(conn);
+    }
 }
 
 static void grant_read_buffers(qdr_tcp_connection_t *conn)
@@ -115,10 +122,10 @@ static int handle_incoming(qdr_tcp_connection_t *conn)
     if (conn->instream) {
         qd_message_extend(qdr_delivery_message(conn->instream), &buffers);
         qdr_delivery_continue(tcp_adaptor->core, conn->instream, false);
-        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i][L%i] Continuing message with %i bytes", conn->conn_id, conn->incoming_id, count);
+        qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%i][L%i] Continuing message with %i bytes", conn->conn_id, conn->incoming_id, count);
     } else {
         qd_message_t *msg = qd_message();
-        qd_message_compose_stream(msg, conn->config->address, conn->reply_to, &buffers);
+        qd_message_compose_stream(msg, conn->config.address, conn->reply_to, &buffers);
 
         /*
         qd_composed_field_t *props = qd_compose(QD_PERFORMATIVE_PROPERTIES, 0);
@@ -143,16 +150,9 @@ static int handle_incoming(qdr_tcp_connection_t *conn)
         */
 
         conn->instream = qdr_link_deliver(conn->incoming, msg, 0, false, 0, 0);
-        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i][L%i] Initiating message with %i bytes", conn->conn_id, conn->incoming_id, count);
+        qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%i][L%i] Initiating message with %i bytes", conn->conn_id, conn->incoming_id, count);
     }
     return count;
-}
-
-static void socket_closed(qdr_tcp_connection_t* tc)
-{
-    qd_message_set_receive_complete(qdr_delivery_message(tc->instream));
-    qdr_delivery_continue(tcp_adaptor->core, tc->instream, true);
-    pn_raw_connection_close(tc->socket);
 }
 
 static void free_qdr_tcp_connection(qdr_tcp_connection_t* tc)
@@ -166,27 +166,18 @@ static void free_qdr_tcp_connection(qdr_tcp_connection_t* tc)
     if (tc->activate_timer) {
         qd_timer_free(tc->activate_timer);
     }
-    //assume proactor will free the socket
+    //proactor will free the socket
     free(tc);
 }
 
 static void handle_disconnected(qdr_tcp_connection_t* conn)
 {
-    if (conn->ingress) {
-        qdr_connection_closed(conn->conn);
-        free_qdr_tcp_connection(conn);
-    } else {
-        // for egress, need to keep the connection and outgoing link
-        // open to receive further connection requests
-        qdr_link_detach(conn->incoming, QD_CLOSED, NULL);
-        qdr_delivery_continue(tcp_adaptor->core, conn->outstream, true);
-        //reset any state tied to specific connection:
-        free(conn->reply_to);
-        conn->reply_to = NULL;
-        conn->instream = NULL;
-        conn->outstream = NULL;
-        conn->socket = NULL;
+    if (conn->instream) {
+        qd_message_set_receive_complete(qdr_delivery_message(conn->instream));
+        qdr_delivery_continue(tcp_adaptor->core, conn->instream, true);
     }
+    qdr_connection_closed(conn->conn);
+    free_qdr_tcp_connection(conn);
 }
 
 static void handle_outgoing(qdr_tcp_connection_t *conn)
@@ -206,9 +197,9 @@ static void handle_outgoing(qdr_tcp_connection_t *conn)
                 qd_log(tcp_adaptor->log_source, QD_LOG_ERROR, "[C%i] empty buffer can't be written", conn->conn_id);
             }
         }
-        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Writing %i bytes", conn->conn_id, bytes_written);
+        qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%i] Writing %i bytes", conn->conn_id, bytes_written);
         if (qd_message_receive_complete(msg)) {
-            socket_closed(conn);
+            pn_raw_connection_close(conn->socket);
         }
     }
 }
@@ -268,7 +259,7 @@ static void qdr_tcp_connection_ingress_accept(qdr_tcp_connection_t* tc)
     qdr_terminus_t *dynamic_source = qdr_terminus(0);
     qdr_terminus_set_dynamic(dynamic_source);
     qdr_terminus_t *target = qdr_terminus(0);
-    qdr_terminus_set_address(target, tc->config->address);
+    qdr_terminus_set_address(target, tc->config.address);
 
     tc->outgoing = qdr_link_first_attach(conn,
                                          QD_OUTGOING,
@@ -276,6 +267,8 @@ static void qdr_tcp_connection_ingress_accept(qdr_tcp_connection_t* tc)
                                          qdr_terminus(0),  //qdr_terminus_t   *target,
                                          "tcp.ingress.out",        //const char       *name,
                                          0,                //const char       *terminus_addr,
+                                         false,
+                                         NULL,
                                          &(tc->outgoing_id));
     qdr_link_set_context(tc->outgoing, tc);
     tc->incoming = qdr_link_first_attach(conn,
@@ -284,6 +277,8 @@ static void qdr_tcp_connection_ingress_accept(qdr_tcp_connection_t* tc)
                                          target,           //qdr_terminus_t   *target,
                                          "tcp.ingress.in",         //const char       *name,
                                          0,                //const char       *terminus_addr,
+                                         false,
+                                         NULL,
                                          &(tc->incoming_id));
     qdr_link_set_context(tc->incoming, tc);
 
@@ -307,13 +302,13 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
         }
     }
     case PN_RAW_CONNECTION_CLOSED_READ: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Closed for reading", conn->conn_id);
-        socket_closed(conn);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Closed for reading", conn->conn_id);
+        pn_raw_connection_close(conn->socket);
         break;
     }
     case PN_RAW_CONNECTION_CLOSED_WRITE: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Closed for writing", conn->conn_id);
-        socket_closed(conn);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Closed for writing", conn->conn_id);
+        pn_raw_connection_close(conn->socket);
         break;
     }
     case PN_RAW_CONNECTION_DISCONNECTED: {
@@ -322,23 +317,23 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
         break;
     }
     case PN_RAW_CONNECTION_NEED_WRITE_BUFFERS: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Need write buffers", conn->conn_id);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Need write buffers", conn->conn_id);
         while (qdr_connection_process(conn->conn)) {}
         break;
     }
     case PN_RAW_CONNECTION_NEED_READ_BUFFERS: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Need read buffers", conn->conn_id);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Need read buffers", conn->conn_id);
         while (qdr_connection_process(conn->conn)) {}
         break;
     }
     case PN_RAW_CONNECTION_WAKE: {
-        qd_log(log, QD_LOG_INFO, "[C%i] Wake-up", conn->conn_id);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Wake-up", conn->conn_id);
         while (qdr_connection_process(conn->conn)) {}
         break;
     }
     case PN_RAW_CONNECTION_READ: {
         int read = handle_incoming(conn);
-        qd_log(log, QD_LOG_INFO, "[C%i] Read %i bytes", conn->conn_id, read);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Read %i bytes", conn->conn_id, read);
         while (qdr_connection_process(conn->conn)) {}
         break;
     }
@@ -353,7 +348,7 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
             }
             qd_message_release_body(qdr_delivery_message(conn->outstream), buffs, n);
         }
-        qd_log(log, QD_LOG_INFO, "[C%i] Wrote %i bytes", conn->conn_id, written);
+        qd_log(log, QD_LOG_DEBUG, "[C%i] Wrote %i bytes", conn->conn_id, written);
         while (qdr_connection_process(conn->conn)) {}
         break;
     }
@@ -369,7 +364,7 @@ static qdr_tcp_connection_t *qdr_tcp_connection_ingress(qd_tcp_listener_t* liste
     tc->ingress = true;
     tc->context.context = tc;
     tc->context.handler = &handle_connection_event;
-    tc->config = &(listener->config);
+    tc->config = listener->config;
     tc->server = listener->server;
     tc->socket = pn_raw_connection();
     pn_raw_connection_set_context(tc->socket, tc);
@@ -381,25 +376,35 @@ static qdr_tcp_connection_t *qdr_tcp_connection_ingress(qd_tcp_listener_t* liste
     return tc;
 }
 
-static qdr_tcp_connection_t *qdr_tcp_connection_egress(qd_tcp_connector_t *connector)
+static void tcp_connector_establish(qdr_tcp_connection_t *conn)
+{
+    qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Connecting to: %s", conn->conn_id, conn->config.host_port);
+    conn->socket = pn_raw_connection();
+    pn_raw_connection_set_context(conn->socket, conn);
+    pn_proactor_raw_connect(qd_server_proactor(conn->server), conn->socket, conn->config.host_port);
+}
+
+static qdr_tcp_connection_t *qdr_tcp_connection_egress(qd_bridge_config_t *config, qd_server_t *server, qdr_delivery_t *initial_delivery)
 {
     qdr_tcp_connection_t* tc = NEW(qdr_tcp_connection_t);
     ZERO(tc);
-    // the timer is used as a way of handling activation of the
-    // qdr_connection before we have an associated pn_raw_connection_t
-    // to wake up
-    tc->activate_timer = qd_timer(tcp_adaptor->core->qd, on_activate, tc);
+    if (initial_delivery) {
+        tc->egress_dispatcher = false;
+    } else {
+        tc->activate_timer = qd_timer(tcp_adaptor->core->qd, on_activate, tc);
+        tc->egress_dispatcher = true;
+    }
     tc->ingress = false;
     tc->context.context = tc;
     tc->context.handler = &handle_connection_event;
-    tc->config = &(connector->config);
-    tc->server = connector->server;
+    tc->config = *config;
+    tc->server = server;
     qdr_connection_info_t *info = qdr_connection_info(false, //bool             is_encrypted,
                                                       false, //bool             is_authenticated,
                                                       true,  //bool             opened,
                                                       "",   //char            *sasl_mechanisms,
                                                       QD_OUTGOING, //qd_direction_t   dir,
-                                                      tc->config->host_port,    //const char      *host,
+                                                      tc->egress_dispatcher ? "egress-dispatch" : tc->config.host_port,    //const char      *host,
                                                       "",    //const char      *ssl_proto,
                                                       "",    //const char      *ssl_cipher,
                                                       "",    //const char      *user,
@@ -432,7 +437,7 @@ static qdr_tcp_connection_t *qdr_tcp_connection_egress(qd_tcp_connector_t *conne
     qdr_connection_set_context(conn, tc);
 
     qdr_terminus_t *source = qdr_terminus(0);
-    qdr_terminus_set_address(source, tc->config->address);
+    qdr_terminus_set_address(source, tc->config.address);
 
     tc->outgoing = qdr_link_first_attach(conn,
                           QD_OUTGOING,
@@ -440,11 +445,16 @@ static qdr_tcp_connection_t *qdr_tcp_connection_egress(qd_tcp_connector_t *conne
                           qdr_terminus(0),  //qdr_terminus_t   *target,
                           "tcp.egress.out", //const char       *name,
                           0,                //const char       *terminus_addr,
+                          !(tc->egress_dispatcher),
+                          initial_delivery,
                           &(tc->outgoing_id));
     qdr_link_set_context(tc->outgoing, tc);
     //the incoming link for egress is created once we receive the
     //message which has the reply to address (and read buffers are
     //granted at that point)
+    if (!tc->egress_dispatcher) {
+        tcp_connector_establish(tc);
+    }
 
     return tc;
 }
@@ -582,8 +592,11 @@ void qd_dispatch_delete_tcp_listener(qd_dispatch_t *qd, void *impl)
 {
     qd_tcp_listener_t *li = (qd_tcp_listener_t*) impl;
     if (li) {
-        //TODO: cleanup and close any associated active connections
+        if (li->pn_listener) {
+            pn_listener_close(li->pn_listener);
+        }
         DEQ_REMOVE(tcp_adaptor->listeners, li);
+        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "Deleted TcpListener for %s, %s:%s", li->config.address, li->config.host, li->config.port);
         qd_tcp_listener_decref(li);
     }
 }
@@ -591,14 +604,6 @@ void qd_dispatch_delete_tcp_listener(qd_dispatch_t *qd, void *impl)
 qd_error_t qd_entity_refresh_tcpListener(qd_entity_t* entity, void *impl)
 {
     return QD_ERROR_NONE;
-}
-
-static void tcp_connector_establish(qdr_tcp_connection_t *conn)
-{
-    qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Connecting to: %s", conn->conn_id, conn->config->host_port);
-    conn->socket = pn_raw_connection();
-    pn_raw_connection_set_context(conn->socket, conn);
-    pn_proactor_raw_connect(qd_server_proactor(conn->server), conn->socket, conn->config->host_port);
 }
 
 static qd_tcp_connector_t *qd_tcp_connector(qd_server_t *server)
@@ -630,16 +635,25 @@ qd_tcp_connector_t *qd_dispatch_configure_tcp_connector(qd_dispatch_t *qd, qd_en
     DEQ_ITEM_INIT(c);
     DEQ_INSERT_TAIL(tcp_adaptor->connectors, c);
     log_tcp_bridge_config(tcp_adaptor->log_source, &c->config, "TcpConnector");
-    //TODO: probably want a pool of egress connections, ready to handle incoming 'connection' streamed messages
-    qdr_tcp_connection_egress(c);
+    c->dispatcher = qdr_tcp_connection_egress(&(c->config), c->server, NULL);
     return c;
+}
+
+static void close_egress_dispatcher(qdr_tcp_connection_t *context)
+{
+    //actual close needs to happen on connection thread
+    context->connector_closed = true;
+    qd_timer_schedule(context->activate_timer, 0);
 }
 
 void qd_dispatch_delete_tcp_connector(qd_dispatch_t *qd, void *impl)
 {
     qd_tcp_connector_t *ct = (qd_tcp_connector_t*) impl;
     if (ct) {
-        //TODO: cleanup and close any associated active connections
+        //need to close the pseudo-connection used for dispatching
+        //deliveries out to live connnections:
+        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "Deleted TcpConnector for %s, %s:%s", ct->config.address, ct->config.host, ct->config.port);
+        close_egress_dispatcher((qdr_tcp_connection_t*) ct->dispatcher);
         DEQ_REMOVE(tcp_adaptor->connectors, ct);
         qd_tcp_connector_decref(ct);
     }
@@ -723,14 +737,15 @@ static uint64_t qdr_tcp_deliver(void *context, qdr_link_t *link, qdr_delivery_t 
     void* link_context = qdr_link_get_context(link);
     if (link_context) {
             qdr_tcp_connection_t* tc = (qdr_tcp_connection_t*) link_context;
-            qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i][L%i] Delivery event", tc->conn_id, tc->outgoing_id);
-            if (!tc->outstream) {
+            qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%i][L%i] Delivery event", tc->conn_id, tc->outgoing_id);
+            if (tc->egress_dispatcher) {
+                qdr_tcp_connection_egress(&(tc->config), tc->server, delivery);
+            } else if (!tc->outstream) {
                 tc->outstream = delivery;
                 if (!tc->ingress) {
                     //on egress, can only set up link for the reverse
                     //direction once we receive the first part of the
                     //message from client to server
-                    tcp_connector_establish(tc);
                     qd_message_t *msg = qdr_delivery_message(delivery);
                     qdr_tcp_connection_copy_reply_to(tc, qd_message_field_iterator(msg, QD_FIELD_REPLY_TO));
                     qdr_terminus_t *target = qdr_terminus(0);
@@ -741,6 +756,8 @@ static uint64_t qdr_tcp_deliver(void *context, qdr_link_t *link, qdr_delivery_t 
                                                          target, //qdr_terminus_t   *target,
                                                          "tcp.egress.in",  //const char       *name,
                                                          0,                //const char       *terminus_addr,
+                                                         false,
+                                                         NULL,
                                                          &(tc->incoming_id));
                     qdr_link_set_context(tc->incoming, tc);
                 }
@@ -762,7 +779,7 @@ static void qdr_tcp_delivery_update(void *context, qdr_delivery_t *dlv, uint64_t
     void* link_context = qdr_link_get_context(qdr_delivery_link(dlv));
     if (link_context) {
         qdr_tcp_connection_t* tc = (qdr_tcp_connection_t*) link_context;
-        qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Delivery update", tc->conn_id);
+        qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%i] Delivery update", tc->conn_id);
     }
 }
 
@@ -782,7 +799,6 @@ static void qdr_tcp_activate(void *notused, qdr_connection_t *c)
     if (context) {
         qdr_tcp_connection_t* conn = (qdr_tcp_connection_t*) context;
         if (conn->socket) {
-            qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Activation triggered, calling pn_raw_connection_wake()", conn->conn_id);
             pn_raw_connection_wake(conn->socket);
         } else if (conn->activate_timer) {
             // On egress, the raw connection is only created once the
@@ -791,7 +807,6 @@ static void qdr_tcp_activate(void *notused, qdr_connection_t *c)
             // received. Prior to that however a subscribing link (and
             // its associated connection must be setup), for which we
             // fake wakeup by using a timer.
-            qd_log(tcp_adaptor->log_source, QD_LOG_INFO, "[C%i] Activation triggered, no socket yet so scheduling timer", conn->conn_id);
             qd_timer_schedule(conn->activate_timer, 0);
         } else {
             qd_log(tcp_adaptor->log_source, QD_LOG_ERROR, "[C%i] Cannot activate", conn->conn_id);
@@ -828,11 +843,10 @@ static void qdr_tcp_adaptor_init(qdr_core_t *core, void **adaptor_context)
                                             qdr_tcp_conn_close,
                                             qdr_tcp_conn_trace);
     adaptor->log_source  = qd_log_source("TCP_ADAPTOR");
+    DEQ_INIT(adaptor->listeners);
+    DEQ_INIT(adaptor->connectors);
     *adaptor_context = adaptor;
 
-    //FIXME: I need adaptor when handling configuration, need to
-    //figure out right way to do that. Just hold on to a pointer as
-    //temporary hack for now.
     tcp_adaptor = adaptor;
 }
 
