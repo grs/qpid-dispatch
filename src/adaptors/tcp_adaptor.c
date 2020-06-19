@@ -690,6 +690,7 @@ static void qdr_tcp_second_attach(void *context, qdr_link_t *link,
                 // a reply to address, as that is when we are able to send
                 // out a message
                 grant_read_buffers(tc);
+                handle_incoming(tc);
             }
             qdr_link_flow(tcp_adaptor->core, link, 10, false);
         } else if (!tc->ingress) {
@@ -760,6 +761,7 @@ static uint64_t qdr_tcp_deliver(void *context, qdr_link_t *link, qdr_delivery_t 
                                                          NULL,
                                                          &(tc->incoming_id));
                     qdr_link_set_context(tc->incoming, tc);
+                    handle_incoming(tc);
                 }
             }
             handle_outgoing(tc);
