@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <string.h>
 
+// @TODO(kgiusti)
+// - properly set 'more' flag on rx_body() callback
+
 
 const uint8_t CR_TOKEN = '\r';
 const uint8_t LF_TOKEN = '\n';
@@ -53,37 +56,38 @@ typedef enum {
 } http1_chunk_state_t;
 
 
-typedef struct scratch_buffer_t {
+typedef struct scratch_memory_t {
     uint8_t *buf;
-    size_t   size;  // of buffer, not contents!
-} scratch_buffer_t;
+    size_t   size;  // of allocated memory, not contents!
+} scratch_memory_t;
 
 
 // state for a single request-response transaction
 //
-struct http1_transfer_t {
-    DEQ_LINKS(struct http1_transfer_t);
+struct h1_lib_request_state_t {
+    DEQ_LINKS(struct h1_lib_request_state_t);
     void         *context;
-    http1_conn_t *conn;
+    h1_lib_connection_t *conn;
     uint32_t      response_code;
+    char         *method;
 
-    bool close_on_done;     // true if connection must be closed when transfer completes
+    bool close_on_done;     // true if connection must be closed when response completes
     bool is_head_method;    // true if request method is HEAD
     bool is_connect_method; // true if request method is CONNECT TODO(kgiusti): supported?
 };
-DEQ_DECLARE(http1_transfer_t, http1_transfer_list_t);
-ALLOC_DECLARE(http1_transfer_t);
-ALLOC_DEFINE(http1_transfer_t);
+DEQ_DECLARE(h1_lib_request_state_t, h1_lib_request_state_list_t);
+ALLOC_DECLARE(h1_lib_request_state_t);
+ALLOC_DEFINE(h1_lib_request_state_t);
 
 
 // The HTTP/1.1 connection
 //
-struct http1_conn_t {
+struct h1_lib_connection_t {
     void *context;
 
     // http requests are added to tail,
     // in-progress response is at head
-    http1_transfer_list_t xfers;
+    h1_lib_request_state_list_t hrs_queue;
 
     // Decoder for current incoming msg.
     //
@@ -103,9 +107,9 @@ struct http1_conn_t {
         qd_iterator_pointer_t  read_ptr;
         qd_iterator_pointer_t  body_ptr;
 
-        http1_transfer_t      *xfer;            // current transfer
+        h1_lib_request_state_t  *hrs;            // current request/response
         http1_msg_state_t      state;
-        scratch_buffer_t       scratch;
+        scratch_memory_t       scratch;
         int                    error;
         const char            *error_msg;
 
@@ -135,53 +139,53 @@ struct http1_conn_t {
     struct encoder_t {
         qd_buffer_list_t       outgoing;
         qd_iterator_pointer_t  write_ptr;
-        http1_transfer_t      *xfer;           // current transfer
+        h1_lib_request_state_t *hrs;           // current request/response state
 
         bool is_request;
         bool crlf_sent;    // true if the CRLF after headers has been sent
     } encoder;
 
-    http1_conn_config_t config;
+    h1_lib_conn_config_t config;
 };
-ALLOC_DECLARE(http1_conn_t);
-ALLOC_DEFINE(http1_conn_t);
+ALLOC_DECLARE(h1_lib_connection_t);
+ALLOC_DEFINE(h1_lib_connection_t);
 
 static void decoder_reset(struct decoder_t *d);
 static void encoder_reset(struct encoder_t *e);
 
 
-// Create a new transfer - this is done when a new http request occurs
-// Keep oldest outstanding tranfer at DEQ_HEAD(conn->xfers)
-static http1_transfer_t *http1_transfer(http1_conn_t *conn)
+// Create a new request state - this is done when a new http request occurs
+// Keep oldest outstanding tranfer at DEQ_HEAD(conn->hrs_queue)
+static h1_lib_request_state_t *h1_lib_request_state(h1_lib_connection_t *conn)
 {
-    http1_transfer_t *xfer = new_http1_transfer_t();
-    ZERO(xfer);
-    xfer->conn = conn;
-    DEQ_INSERT_TAIL(conn->xfers, xfer);
-    return xfer;
+    h1_lib_request_state_t *hrs = new_h1_lib_request_state_t();
+    ZERO(hrs);
+    hrs->conn = conn;
+    DEQ_INSERT_TAIL(conn->hrs_queue, hrs);
+    return hrs;
 }
 
 
-static void http1_transfer_free(http1_transfer_t *xfer)
+static void h1_lib_request_state_free(h1_lib_request_state_t *hrs)
 {
-    if (xfer) {
-        http1_conn_t *conn = xfer->conn;
-        assert(conn->decoder.xfer != xfer);
-        assert(conn->encoder.xfer != xfer);
-        DEQ_REMOVE(conn->xfers, xfer);
-        free_http1_transfer_t(xfer);
+    if (hrs) {
+        h1_lib_connection_t *conn = hrs->conn;
+        assert(conn->decoder.hrs != hrs);
+        assert(conn->encoder.hrs != hrs);
+        DEQ_REMOVE(conn->hrs_queue, hrs);
+        free_h1_lib_request_state_t(hrs);
     }
 }
 
 
-http1_conn_t *http1_connection(http1_conn_config_t *config, void *context)
+h1_lib_connection_t *h1_lib_connection(h1_lib_conn_config_t *config, void *context)
 {
-    http1_conn_t *conn = new_http1_conn_t();
+    h1_lib_connection_t *conn = new_h1_lib_connection_t();
     ZERO(conn);
 
     conn->context = context;
     conn->config = *config;
-    DEQ_INIT(conn->xfers);
+    DEQ_INIT(conn->hrs_queue);
 
     encoder_reset(&conn->encoder);
     DEQ_INIT(conn->encoder.outgoing);
@@ -197,28 +201,28 @@ http1_conn_t *http1_connection(http1_conn_config_t *config, void *context)
 
 // Close the connection conn.
 //
-// This cancels all outstanding transfers and destroys the connection.  If
+// This cancels all outstanding requests and destroys the connection.  If
 // there is an incoming response message body being parsed when this function
 // is invoked it will signal the end of the message.
 //
-void http1_connection_close(http1_conn_t *conn)
+void h1_lib_connection_close(h1_lib_connection_t *conn)
 {
     if (conn) {
         struct decoder_t *decoder = &conn->decoder;
         if (!decoder->error) {
             if (decoder->state == HTTP1_MSG_STATE_BODY
-                && decoder->xfer) {
+                && decoder->hrs) {
 
                 // terminate the incoming message as the server has closed the
                 // connection to indicate the end of the message
-                conn->config.xfer_rx_done(decoder->xfer);
+                conn->config.rx_done(decoder->hrs);
             }
 
-            // notify any outstanding transfers
-            http1_transfer_t *xfer = DEQ_HEAD(conn->xfers);
-            while (xfer) {
-                conn->config.xfer_done(xfer);
-                xfer = DEQ_NEXT(xfer);
+            // notify any outstanding requests
+            h1_lib_request_state_t *hrs = DEQ_HEAD(conn->hrs_queue);
+            while (hrs) {
+                conn->config.request_complete(hrs);
+                hrs = DEQ_NEXT(hrs);
             }
         }
 
@@ -228,13 +232,13 @@ void http1_connection_close(http1_conn_t *conn)
         qd_buffer_list_free_buffers(&conn->encoder.outgoing);
         free(conn->decoder.scratch.buf);
 
-        http1_transfer_t *xfer = DEQ_HEAD(conn->xfers);
-        while (xfer) {
-            http1_transfer_free(xfer);  // removes from conn->xfers list
-            xfer = DEQ_HEAD(conn->xfers);
+        h1_lib_request_state_t *hrs = DEQ_HEAD(conn->hrs_queue);
+        while (hrs) {
+            h1_lib_request_state_free(hrs);  // removes from conn->hrs_queue
+            hrs = DEQ_HEAD(conn->hrs_queue);
         }
 
-        free_http1_conn_t(conn);
+        free_h1_lib_connection_t(conn);
     }
 }
 
@@ -247,7 +251,7 @@ static void decoder_reset(struct decoder_t *decoder)
     // track the current position in the incoming data stream
 
     decoder->body_ptr = NULL_I_PTR;
-    decoder->xfer = 0;
+    decoder->hrs = 0;
     decoder->state = HTTP1_MSG_STATE_START;
     decoder->content_length = 0;
     decoder->chunk_state = HTTP1_CHUNK_HEADER;
@@ -267,7 +271,7 @@ static void decoder_reset(struct decoder_t *decoder)
 static void encoder_reset(struct encoder_t *encoder)
 {
     // do not touch the write_ptr or the outgoing queue as there may be more messages to send.
-    encoder->xfer = 0;
+    encoder->hrs = 0;
     encoder->is_request = false;
     encoder->crlf_sent = false;
 }
@@ -414,7 +418,7 @@ static bool read_line(qd_iterator_pointer_t *data, qd_iterator_pointer_t *line)
 }
 
 
-static bool ensure_scratch_size(scratch_buffer_t *b, size_t required)
+static bool ensure_scratch_size(scratch_memory_t *b, size_t required)
 {
     if (b->size < required) {
         if (b->buf)
@@ -514,7 +518,7 @@ static bool parse_field(qd_iterator_pointer_t *line, qd_iterator_pointer_t *fiel
 // parse the HTTP/1.1 request line:
 // "method SP request-target SP HTTP-version CRLF"
 //
-static bool parse_request_line(http1_conn_t *conn, struct decoder_t *decoder, qd_iterator_pointer_t *line)
+static bool parse_request_line(h1_lib_connection_t *conn, struct decoder_t *decoder, qd_iterator_pointer_t *line)
 {
     qd_iterator_pointer_t method = {0};
     qd_iterator_pointer_t target = {0};
@@ -561,21 +565,23 @@ static bool parse_request_line(http1_conn_t *conn, struct decoder_t *decoder, qd
         return decoder->error;
     }
 
-    http1_transfer_t *xfer = http1_transfer(conn);
+    h1_lib_request_state_t *hrs = h1_lib_request_state(conn);
 
     // check for methods that do not support body content in the response:
     if (strcmp((char*)method_str, "HEAD") == 0)
-        xfer->is_head_method = true;
+        hrs->is_head_method = true;
     else if (strcmp((char*)method_str, "CONNECT") == 0)
-        xfer->is_connect_method = true;
+        hrs->is_connect_method = true;
 
-    decoder->xfer = xfer;
+    hrs->method = qd_strdup((char*) method_str);
+
+    decoder->hrs = hrs;
     decoder->is_request = true;
     decoder->is_1_0 = (minor == 0);
 
-    decoder->error = conn->config.xfer_rx_request(xfer, (char*)method_str, (char*)target_str, (char*)version_str);
+    decoder->error = conn->config.rx_request(hrs, (char*)method_str, (char*)target_str, major, minor);
     if (decoder->error)
-        decoder->error_msg = "xfer_rx_request callback error";
+        decoder->error_msg = "hrs_rx_request callback error";
     return decoder->error;
 }
 
@@ -583,7 +589,7 @@ static bool parse_request_line(http1_conn_t *conn, struct decoder_t *decoder, qd
 // parse the HTTP/1.1 response line
 // "HTTP-version SP status-code [SP reason-phrase] CRLF"
 //
-static int parse_response_line(http1_conn_t *conn, struct decoder_t *decoder, qd_iterator_pointer_t *line)
+static int parse_response_line(h1_lib_connection_t *conn, struct decoder_t *decoder, qd_iterator_pointer_t *line)
 {
     qd_iterator_pointer_t version = {0};
     qd_iterator_pointer_t status_code = {0};
@@ -599,23 +605,23 @@ static int parse_response_line(http1_conn_t *conn, struct decoder_t *decoder, qd
     }
 
     // Responses arrive in the same order as requests are generated so this new
-    // response corresponds to head xfer
-    http1_transfer_t *xfer = DEQ_HEAD(conn->xfers);
-    if (!xfer) {
+    // response corresponds to head hrs
+    h1_lib_request_state_t *hrs = DEQ_HEAD(conn->hrs_queue);
+    if (!hrs) {
         // receiving a response without a corresponding request
         decoder->error_msg = "Spurious HTTP response received";
         decoder->error = HTTP1_STATUS_SERVER_ERR;
         return decoder->error;
     }
 
-    assert(!decoder->xfer);   // state machine violation
-    assert(xfer->response_code == 0);
+    assert(!decoder->hrs);   // state machine violation
+    assert(hrs->response_code == 0);
 
-    decoder->xfer = xfer;
+    decoder->hrs = hrs;
 
     unsigned char code_str[4];
     pointer_2_str(&status_code, code_str, 4);
-    xfer->response_code = atoi((char*) code_str);
+    hrs->response_code = atoi((char*) code_str);
 
     // the reason phrase is optional, and may contain spaces
 
@@ -654,11 +660,12 @@ static int parse_response_line(http1_conn_t *conn, struct decoder_t *decoder, qd
     decoder->is_request = false;
     decoder->is_1_0 = (minor == 0);
 
-    decoder->error = conn->config.xfer_rx_response(decoder->xfer, (char*)version_str,
-                                                   xfer->response_code,
-                                                   (offset) ? (char*)reason_str: 0);
+    decoder->error = conn->config.rx_response(decoder->hrs,
+                                              hrs->response_code,
+                                              (offset) ? (char*)reason_str: 0,
+                                              major, minor);
     if (decoder->error)
-        decoder->error_msg = "xfer_rx_response callback error";
+        decoder->error_msg = "hrs_rx_response callback error";
 
     return decoder->error;
 }
@@ -666,7 +673,7 @@ static int parse_response_line(http1_conn_t *conn, struct decoder_t *decoder, qd
 
 // parse the first line of an incoming http message
 //
-static bool parse_start_line(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_start_line(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     qd_iterator_pointer_t *rptr = &decoder->read_ptr;
     qd_iterator_pointer_t line;
@@ -695,7 +702,7 @@ static bool parse_start_line(http1_conn_t *conn, struct decoder_t *decoder)
 // Called after the last incoming header was decoded and passed to the
 // application
 //
-static bool process_headers_done(http1_conn_t *conn, struct decoder_t *decoder)
+static bool process_headers_done(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     // Flush all buffers processed so far - no longer needed
 
@@ -721,12 +728,6 @@ static bool process_headers_done(http1_conn_t *conn, struct decoder_t *decoder)
         }
     }
 
-    decoder->error = conn->config.xfer_rx_headers_done(decoder->xfer);
-    if (decoder->error) {
-        decoder->error_msg = "xfer_rx_headers_done callback error";
-        return false;
-    }
-
     // determine if a body is present (ref RFC7230 sec 3.3.3 Message Body Length)
     bool has_body;
     if (decoder->is_request) {
@@ -740,19 +741,25 @@ static bool process_headers_done(http1_conn_t *conn, struct decoder_t *decoder)
         // size via Content-Length or chunked encoder, OR its length is unspecified
         // and the message body is terminated by closing the connection.
         //
-        http1_transfer_t *xfer = decoder->xfer;
-        has_body = !(xfer->is_head_method       ||
-                     xfer->is_connect_method    ||
-                     xfer->response_code == 204 ||     // No Content
-                     xfer->response_code == 205 ||     // Reset Content
-                     xfer->response_code == 304 ||     // Not Modified
-                     IS_INFO_RESPONSE(xfer->response_code));
+        h1_lib_request_state_t *hrs = decoder->hrs;
+        has_body = !(hrs->is_head_method       ||
+                     hrs->is_connect_method    ||
+                     hrs->response_code == 204 ||     // No Content
+                     hrs->response_code == 205 ||     // Reset Content
+                     hrs->response_code == 304 ||     // Not Modified
+                     IS_INFO_RESPONSE(hrs->response_code));
         if (has_body) {
             // no body if explicit Content-Length of zero
             if (decoder->hdr_content_length && decoder->content_length == 0) {
                 has_body = false;
             }
         }
+    }
+
+    decoder->error = conn->config.rx_headers_done(decoder->hrs, has_body);
+    if (decoder->error) {
+        decoder->error_msg = "hrs_rx_headers_done callback error";
+        return false;
     }
 
     if (has_body) {
@@ -770,7 +777,7 @@ static bool process_headers_done(http1_conn_t *conn, struct decoder_t *decoder)
 
 // process a received header to determine message body length, etc.
 //
-static int process_header(http1_conn_t *conn, struct decoder_t *decoder, const uint8_t *key, const uint8_t *value)
+static int process_header(h1_lib_connection_t *conn, struct decoder_t *decoder, const uint8_t *key, const uint8_t *value)
 {
     int parse_error = decoder->is_request ? HTTP1_STATUS_BAD_REQ : HTTP1_STATUS_SERVER_ERR;
 
@@ -807,12 +814,12 @@ static int process_header(http1_conn_t *conn, struct decoder_t *decoder, const u
 
 // Parse out the header key and value
 //
-static bool parse_header(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_header(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     qd_iterator_pointer_t *rptr = &decoder->read_ptr;
     qd_iterator_pointer_t line;
-    http1_transfer_t *xfer = decoder->xfer;
-    assert(xfer);  // else state machine busted
+    h1_lib_request_state_t *hrs = decoder->hrs;
+    assert(hrs);  // else state machine busted
 
     if (read_line(rptr, &line)) {
         debug_print_iterator_pointer("header:", &line);
@@ -862,9 +869,9 @@ static bool parse_header(http1_conn_t *conn, struct decoder_t *decoder)
         process_header(conn, decoder, key_str, value_str);
 
         if (!decoder->error) {
-            decoder->error = conn->config.xfer_rx_header(xfer, (char *)key_str, (char *)value_str);
+            decoder->error = conn->config.rx_header(hrs, (char *)key_str, (char *)value_str);
             if (decoder->error)
-                decoder->error_msg = "xfer_rx_header callback error";
+                decoder->error_msg = "hrs_rx_header callback error";
         }
 
         return !!rptr->remaining;
@@ -880,7 +887,7 @@ static bool parse_header(http1_conn_t *conn, struct decoder_t *decoder)
 
 // Pass message body data up to the application.
 //
-static inline int consume_body_data(http1_conn_t *conn, bool flush)
+static inline int consume_body_data(h1_lib_connection_t *conn, bool flush)
 {
     struct decoder_t *decoder = &conn->decoder;
     qd_iterator_pointer_t *body_ptr = &decoder->body_ptr;
@@ -889,9 +896,10 @@ static inline int consume_body_data(http1_conn_t *conn, bool flush)
     // shortcut: if no more data to parse send the entire incoming chain
     if (rptr->remaining == 0) {
 
-        decoder->error = conn->config.xfer_rx_body(decoder->xfer, &decoder->incoming,
-                                                   body_ptr->cursor - qd_buffer_base(body_ptr->buffer),
-                                                   body_ptr->remaining);
+        decoder->error = conn->config.rx_body(decoder->hrs, &decoder->incoming,
+                                              body_ptr->cursor - qd_buffer_base(body_ptr->buffer),
+                                              body_ptr->remaining,
+                                              true);
         DEQ_INIT(decoder->incoming);
         *body_ptr = NULL_I_PTR;
         *rptr = NULL_I_PTR;
@@ -933,7 +941,7 @@ static inline int consume_body_data(http1_conn_t *conn, bool flush)
         body_ptr->remaining = 0;
     }
 
-    decoder->error = conn->config.xfer_rx_body(decoder->xfer, &blist, body_offset, octets);
+    decoder->error = conn->config.rx_body(decoder->hrs, &blist, body_offset, octets, true);
     return decoder->error;
 }
 
@@ -942,7 +950,7 @@ static inline int consume_body_data(http1_conn_t *conn, bool flush)
 // parsing the start of a chunked header:
 // <chunk size in hex>CRLF
 //
-static bool parse_body_chunked_header(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_body_chunked_header(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     qd_iterator_pointer_t *rptr = &decoder->read_ptr;
     qd_iterator_pointer_t line;
@@ -984,7 +992,7 @@ static bool parse_body_chunked_header(http1_conn_t *conn, struct decoder_t *deco
 
 // Parse the data section of a chunk
 //
-static bool parse_body_chunked_data(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_body_chunked_data(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     qd_iterator_pointer_t *rptr = &decoder->read_ptr;
     qd_iterator_pointer_t *body_ptr = &decoder->body_ptr;
@@ -1007,7 +1015,7 @@ static bool parse_body_chunked_data(http1_conn_t *conn, struct decoder_t *decode
 
 // Keep reading chunk trailers until the terminating empty line is read
 //
-static bool parse_body_chunked_trailer(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_body_chunked_trailer(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     qd_iterator_pointer_t *rptr = &decoder->read_ptr;
     qd_iterator_pointer_t *body_ptr = &decoder->body_ptr;
@@ -1032,7 +1040,7 @@ static bool parse_body_chunked_trailer(http1_conn_t *conn, struct decoder_t *dec
 
 // parse an incoming message body which is chunk encoded
 // Return True if there is more data pending to parse
-static bool parse_body_chunked(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_body_chunked(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     bool more = true;
     switch (decoder->chunk_state) {
@@ -1056,7 +1064,7 @@ static bool parse_body_chunked(http1_conn_t *conn, struct decoder_t *decoder)
 
 // parse an incoming message body which is Content-Length bytes long
 //
-static bool parse_body_content(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_body_content(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     qd_iterator_pointer_t *rptr = &decoder->read_ptr;
     qd_iterator_pointer_t *body_ptr = &decoder->body_ptr;
@@ -1074,7 +1082,7 @@ static bool parse_body_content(http1_conn_t *conn, struct decoder_t *decoder)
 }
 
 
-static bool parse_body(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_body(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
     if (decoder->is_chunked)
         return parse_body_chunked(conn, decoder);
@@ -1084,13 +1092,14 @@ static bool parse_body(http1_conn_t *conn, struct decoder_t *decoder)
 
     // otherwise no explict body size, so just keep passing the entire unparsed
     // incoming chain along until the remote closes the connection
-    decoder->error = conn->config.xfer_rx_body(decoder->xfer,
-                                               &decoder->incoming,
-                                               decoder->read_ptr.cursor
-                                               - qd_buffer_base(decoder->read_ptr.buffer),
-                                               decoder->read_ptr.remaining);
+    decoder->error = conn->config.rx_body(decoder->hrs,
+                                          &decoder->incoming,
+                                          decoder->read_ptr.cursor
+                                          - qd_buffer_base(decoder->read_ptr.buffer),
+                                          decoder->read_ptr.remaining,
+                                          true);
     if (decoder->error) {
-        decoder->error_msg = "xfer_rx_body callback error";
+        decoder->error_msg = "hrs_rx_body callback error";
         return false;
     }
 
@@ -1103,25 +1112,25 @@ static bool parse_body(http1_conn_t *conn, struct decoder_t *decoder)
 
 // Called when incoming message is complete
 //
-static bool parse_done(http1_conn_t *conn, struct decoder_t *decoder)
+static bool parse_done(h1_lib_connection_t *conn, struct decoder_t *decoder)
 {
-    http1_transfer_t *xfer = decoder->xfer;
+    h1_lib_request_state_t *hrs = decoder->hrs;
     bool is_response = !decoder->is_request;
 
     if (!decoder->error) {
         // signal the message receive is complete
-        conn->config.xfer_rx_done(xfer);
+        conn->config.rx_done(hrs);
 
         if (is_response) {   // request<->response transfer complete
 
             // Informational 1xx response codes are NOT teriminal - further responses are allowed!
-            if (IS_INFO_RESPONSE(xfer->response_code)) {
-                xfer->response_code = 0;
+            if (IS_INFO_RESPONSE(hrs->response_code)) {
+                hrs->response_code = 0;
             } else {
                 // The message exchange is complete
-                conn->config.xfer_done(xfer);
-                decoder->xfer = 0;
-                http1_transfer_free(xfer);
+                conn->config.request_complete(hrs);
+                decoder->hrs = 0;
+                h1_lib_request_state_free(hrs);
             }
         }
 
@@ -1135,7 +1144,7 @@ static bool parse_done(http1_conn_t *conn, struct decoder_t *decoder)
 // Main decode loop.
 // Process received data until it is exhausted
 //
-static int decode_incoming(http1_conn_t *conn)
+static int decode_incoming(h1_lib_connection_t *conn)
 {
     struct decoder_t *decoder = &conn->decoder;
     bool more = true;
@@ -1159,20 +1168,20 @@ static int decode_incoming(http1_conn_t *conn)
 }
 
 
-void *http1_connection_get_context(http1_conn_t *conn)
+void *h1_lib_connection_get_context(h1_lib_connection_t *conn)
 {
     return conn->context;
 }
 
 // Push inbound network data into the http1 protocol engine.
 //
-// All of the xfer_rx callback will occur in the context of this call. This
+// All of the hrs_rx callback will occur in the context of this call. This
 // returns zero on success otherwise an error code.  Any error occuring during
 // a callback will be reflected in the return value of this function.  It is
-// expected that the caller will call http1_connection_close on a non-zero
+// expected that the caller will call h1_lib_connection_close on a non-zero
 // return value.
 //
-int http1_connection_rx_data(http1_conn_t *conn, qd_buffer_list_t *data, size_t len)
+int h1_lib_connection_rx_data(h1_lib_connection_t *conn, qd_buffer_list_t *data, size_t len)
 {
     struct decoder_t *decoder = &conn->decoder;
     bool init_ptrs = DEQ_IS_EMPTY(decoder->incoming);
@@ -1195,79 +1204,100 @@ int http1_connection_rx_data(http1_conn_t *conn, qd_buffer_list_t *data, size_t 
     return decode_incoming(conn);
 }
 
-void http1_transfer_set_context(http1_transfer_t *xfer, void *context)
-{
-    xfer->context = context;
-}
 
-void *http1_transfer_get_context(const http1_transfer_t *xfer)
+void h1_lib_request_state_set_context(h1_lib_request_state_t *hrs, void *context)
 {
-    return xfer->context;
-}
-
-http1_conn_t *http1_transfer_get_connection(const http1_transfer_t *xfer)
-{
-    return xfer->conn;
+    hrs->context = context;
 }
 
 
-// initiate a new HTTP request.  This creates a new transfer.
+void *h1_lib_request_state_get_context(const h1_lib_request_state_t *hrs)
+{
+    return hrs->context;
+}
+
+
+h1_lib_connection_t *h1_lib_request_state_get_connection(const h1_lib_request_state_t *hrs)
+{
+    return hrs->conn;
+}
+
+
+const char *h1_lib_request_state_method(const h1_lib_request_state_t *hrs)
+{
+    return hrs->method;
+}
+
+
+// initiate a new HTTP request.  This creates a new request state.
 // request = <method>SP<target>SP<version>CRLF
-// Expects version to be in the format "HTTP/X.Y"
 //
-http1_transfer_t *http1_tx_request(http1_conn_t *conn, const char *method, const char *target, const char *version)
+h1_lib_request_state_t *h1_lib_tx_request(h1_lib_connection_t *conn, const char *method, const char *target,
+                                          uint32_t version_major, uint32_t version_minor)
 {
     struct encoder_t *encoder = &conn->encoder;
-    assert(!encoder->xfer);   // error: transfer already in progress
+    assert(!encoder->hrs);   // error: transfer already in progress
     assert(conn->config.type == HTTP1_CONN_SERVER);
 
-    http1_transfer_t *xfer = encoder->xfer = http1_transfer(conn);
+    h1_lib_request_state_t *hrs = encoder->hrs = h1_lib_request_state(conn);
     encoder->is_request = true;
     encoder->crlf_sent = false;
 
     if (strcmp((char*)method, "HEAD") == 0)
-        xfer->is_head_method = true;
+        hrs->is_head_method = true;
     else if (strcmp((char*)method, "CONNECT") == 0)
-        xfer->is_connect_method = true;
+        hrs->is_connect_method = true;
 
     write_string(encoder, method);
     write_string(encoder, " ");
     write_string(encoder, target);
     write_string(encoder, " ");
-    write_string(encoder, version);
+    {
+        char version[64];
+        snprintf(version, 64, "HTTP/%"PRIu32".%"PRIu32, version_major, version_minor);
+        write_string(encoder, version);
+    }
     write_string(encoder, CRLF);
 
-    return xfer;
+    return hrs;
 }
 
 
-// Send an HTTP response msg.  xfer must correspond to the "oldest" outstanding
-// request that arrived via the xfer_rx_request callback for this connection.
-// version is expected to be in the form "HTTP/x.y"
+// Send an HTTP response msg.  hrs must correspond to the "oldest" outstanding
+// request that arrived via the hrs_rx_request callback for this connection.
 // status_code is expected to be 100 <= status_code <= 999
 // status-line = HTTP-version SP status-code SP reason-phrase CRLF
 //
-int http1_tx_response(http1_transfer_t *xfer, const char *version, int status_code, const char *reason_phrase)
+int h1_lib_tx_response(h1_lib_request_state_t *hrs, int status_code, const char *reason_phrase,
+                       uint32_t version_major, uint32_t version_minor)
 {
-    http1_conn_t *conn = http1_transfer_get_connection(xfer);
+    h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
     struct encoder_t *encoder = &conn->encoder;
 
     assert(conn->config.type == HTTP1_CONN_CLIENT);
-    assert(!encoder->xfer);   // error: transfer already in progress
-    assert(DEQ_HEAD(conn->xfers) == xfer);   // error: response not in order!
-    assert(xfer->response_code == 0);
+    assert(!encoder->hrs);   // error: transfer already in progress
+    assert(DEQ_HEAD(conn->hrs_queue) == hrs);   // error: response not in order!
+    assert(hrs->response_code == 0);
 
-    encoder->xfer = xfer;
+    encoder->hrs = hrs;
     encoder->is_request = false;
     encoder->crlf_sent = false;
-    xfer->response_code = status_code;
+    hrs->response_code = status_code;
 
-    char code_str[32];
-    snprintf(code_str, 32, "%d", status_code);
+    {
+        char version[64];
+        snprintf(version, 64, "HTTP/%"PRIu32".%"PRIu32, version_major, version_minor);
+        write_string(encoder, version);
+    }
 
-    write_string(encoder, version);
     write_string(encoder, " ");
-    write_string(encoder, code_str);
+
+    {
+        char code_str[32];
+        snprintf(code_str, 32, "%d", status_code);
+        write_string(encoder, code_str);
+    }
+
     if (reason_phrase) {
         write_string(encoder, " ");
         write_string(encoder, reason_phrase);
@@ -1280,11 +1310,11 @@ int http1_tx_response(http1_transfer_t *xfer, const char *version, int status_co
 
 // Add a header field to an outgoing message
 // header-field   = field-name ":" OWS field-value OWS
-int http1_tx_add_header(http1_transfer_t *xfer, const char *key, const char *value)
+int h1_lib_tx_add_header(h1_lib_request_state_t *hrs, const char *key, const char *value)
 {
-    http1_conn_t *conn = http1_transfer_get_connection(xfer);
+    h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
     struct encoder_t *encoder = &conn->encoder;
-    assert(encoder->xfer == xfer);  // xfer not current transfer
+    assert(encoder->hrs == hrs);  // hrs not current transfer
 
     write_string(encoder, key);
     write_string(encoder, ": ");
@@ -1309,12 +1339,12 @@ int http1_tx_add_header(http1_transfer_t *xfer, const char *key, const char *val
 
 
 // just forward the body chain along
-int http1_tx_body(http1_transfer_t *xfer, qd_buffer_list_t *data, size_t offset, size_t len)
+int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_buffer_list_t *data, size_t offset, size_t len)
 {
-    http1_conn_t *conn = http1_transfer_get_connection(xfer);
+    h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
     struct encoder_t *encoder = &conn->encoder;
 
-    fprintf(stderr, "http1_tx_body(offset=%zu size=%zu)\n", offset, len);
+    fprintf(stderr, "h1_lib_tx_body(offset=%zu size=%zu)\n", offset, len);
     
     if (!encoder->crlf_sent) {
         // need to terminate any headers by sending the plain CRLF that follows
@@ -1338,9 +1368,9 @@ int http1_tx_body(http1_transfer_t *xfer, qd_buffer_list_t *data, size_t offset,
 }
 
 
-int http1_tx_done(http1_transfer_t *xfer)
+int h1_lib_tx_done(h1_lib_request_state_t *hrs)
 {
-    http1_conn_t *conn = http1_transfer_get_connection(xfer);
+    h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
     struct encoder_t *encoder = &conn->encoder;
 
     if (!encoder->crlf_sent) {
@@ -1360,14 +1390,14 @@ int http1_tx_done(http1_transfer_t *xfer)
     encoder_reset(encoder);
 
     if (is_response) {
-        if (IS_INFO_RESPONSE(xfer->response_code)) {
+        if (IS_INFO_RESPONSE(hrs->response_code)) {
             // this is a non-terminal response. Another response is expected
             // for this request so just reset the transfer state
-            xfer->response_code = 0;
+            hrs->response_code = 0;
         } else {
             // The message exchange is complete
-            conn->config.xfer_done(xfer);
-            http1_transfer_free(xfer);
+            conn->config.request_complete(hrs);
+            h1_lib_request_state_free(hrs);
         }
     }
 
