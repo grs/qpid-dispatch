@@ -62,12 +62,32 @@ struct qdr_http1_request_t {
 
     // flags
 
-    bool headers_sent;
+    bool headers_sent;  // HTTP headers written to raw connection
     bool connection_close_flag;
     bool receive_complete;
 };
 ALLOC_DECLARE(qdr_http1_request_t);
 DEQ_DECLARE(qdr_http1_request_t, qdr_http1_request_list_t);
+
+
+// Data to be written out the raw connection
+//
+typedef struct qdr_http1_out_data_t {
+    DEQ_LINKS(struct qdr_http1_out_data_t);
+
+    // data is either in a raw buffer chain
+    // or a message body data (not both!)
+
+    qd_buffer_list_t raw_buffers;
+    qd_message_body_data_t *body_data;
+
+    int buffer_count;  // # total buffers
+    int next_buffer;   // offset to next buffer to send
+    int free_count;    // # buffers returned from proton
+
+} qdr_http1_out_data_t;
+ALLOC_DECLARE(qdr_http1_out_data_t);
+DEQ_DECLARE(qdr_http1_out_data_t, qdr_http1_out_data_list_t);
 
 
 // A single HTTP adaptor connection.
@@ -121,8 +141,11 @@ typedef struct qdr_http1_connection_t {
     //
     qdr_http1_request_list_t requests;
 
-    // pending write to proactor
-    qd_buffer_list_t       out_buffers;
+    // Pending data to write to proactor.  out_data is a FIFO queue. write_ptr
+    // points to the out_data instance that is currently being written.  As
+    // writes complete entries are released in order starting at HEAD.
+    qdr_http1_out_data_list_t  out_data;
+    qdr_http1_out_data_t      *write_ptr;
 
     bool trace;
     bool close_connection;
@@ -139,6 +162,13 @@ ALLOC_DECLARE(qdr_http1_connection_t);
 #define REASON_HEADER_KEY    "http:reason"    // from response (optional)
 #define TARGET_HEADER_KEY    "http:target"    // request target
 #define STATUS_HEADER_KEY    "http:status"    // response status (integer)
+
+
+// http1_adaptor.c
+//
+void qdr_http1_write_flush(qdr_http1_connection_t *hconn);
+void qdr_http1_write_buffer_list(qdr_http1_connection_t *hconn, qd_buffer_list_t *blist);
+void qdr_http1_write_body_data(qdr_http1_connection_t *hconn, qd_message_body_data_t *body_data);
 
 
 // http1_client.c protocol adaptor callbacks

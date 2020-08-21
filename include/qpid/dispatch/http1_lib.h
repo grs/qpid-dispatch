@@ -20,6 +20,7 @@
  *
  */
 #include <qpid/dispatch/buffer.h>
+#include <qpid/dispatch/message.h>
 
 #include <inttypes.h>
 #include <stdbool.h>
@@ -70,8 +71,22 @@ typedef struct h1_lib_conn_config_t {
 
     h1_lib_conn_type_t type;
 
-    // called with output data to write to the network
-    void (*conn_tx_data)(h1_lib_connection_t *conn, qd_buffer_list_t *data, size_t offset, unsigned int len);
+    // Callbacks to send data out the raw connection.
+
+    // tx_msg_headers()
+    // Send HTTP status and header lines.  This may be called multiple times as
+    // header data becomes available for sending.  The caller assumes ownership
+    // of the buffer list and must release the buffers when done.  len is set
+    // to the total octets of data in the list.
+    //
+    void (*tx_msg_headers)(h1_lib_connection_t *conn, qd_buffer_list_t *data, unsigned int len);
+
+    // tx_msg_body()
+    // Called with outgoing body_data after all headers have been sent.  Only
+    // called if the outgoing HTTP message has a body. The caller assumes
+    // ownership of the body_data and must release it when done.
+    //
+    void (*tx_msg_body)(h1_lib_connection_t *conn, qd_message_body_data_t *body_data);
 
     //
     // RX message callbacks
@@ -152,9 +167,9 @@ int h1_lib_tx_response(h1_lib_request_state_t *hrs, int status_code, const char 
 //
 int h1_lib_tx_add_header(h1_lib_request_state_t *hrs, const char *key, const char *value);
 
-// stream outgoing body data
+// Stream outgoing body data.  Ownership of body_data is passed to the caller.
 //
-int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_buffer_list_t *data, size_t offset, uintmax_t len);
+int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_message_body_data_t *body_data);
 
 // outgoing message construction complete
 int h1_lib_tx_done(h1_lib_request_state_t *hrs);

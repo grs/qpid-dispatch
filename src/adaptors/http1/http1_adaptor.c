@@ -22,6 +22,9 @@
 #include <stdio.h>
 #include <inttypes.h>
 
+#define RAW_BUFFER_BATCH  16
+
+
 ////////////////////////////////////////
 // TODO:
 // * Deal with serializing the responses in the case of pipelined requests
@@ -91,8 +94,8 @@ DEQ_DECLARE(buffer_chain_t, buffer_chain_list_t);
 ALLOC_DECLARE(buffer_chain_t);
 ALLOC_DEFINE(buffer_chain_t);
 
-
 ALLOC_DEFINE(qdr_http1_request_t);
+ALLOC_DEFINE(qdr_http1_out_data_t);
 ALLOC_DEFINE(qdr_http1_connection_t);
 
 
@@ -100,157 +103,131 @@ qdr_http1_adaptor_t *qdr_http1_adaptor;
 
 
 //
-// utility crap
+// Raw Connection Write Buffer Management
 //
-#if KAG_TODO
-static inline void str_lower(char *s)
+
+
+void qdr_http1_write_flush(qdr_http1_connection_t *hconn)
 {
-    while (*s) {
-        *s = tolower(*s);
-        ++s;
-    }
-}
-#endif  // KAG_TODO
+    pn_raw_buffer_t buffers[RAW_BUFFER_BATCH];
+    size_t count = pn_raw_connection_write_buffers_capacity(hconn->raw_conn);
 
+    while (count > 0 && hconn->write_ptr) {
 
-#if KAG_TODO
-// update the list of HTTP header keys that must be filtered out
-// before mapping to AMQP
-//
-static void filter_add_header(qdr_http1_connection_t *hconn,
-                              const char *header)
-{
-    if (!hconn->header_filter) {
-        hconn->filter_max = 10;
-        hconn->filter_end = 0;
-        hconn->header_filter = qd_calloc(10, sizeof(char *));
+        qdr_http1_out_data_t *od     = hconn->write_ptr;
+        qd_buffer_t          *wbuf   = 0;
+        int                   od_len = MIN(count,
+                                           (od->buffer_count - od->next_buffer));
+        assert(od_len);  // error: no data @ write_ptr?
 
-    } else if (hconn->filter_end == hconn->filter_max) {
-        // expand the array
-        hconn->filter_max += 10
-        hconn->header_filter = qd_realloc(hconn->header_filter,
-                                          sizeof(char *) * hconn->filter_max);
-        memset(&header_filter[hconn->filter_end], 0, sizeof(char *) * 10);
-    }
-    hconn->header_filter[hconn->filter_end++] = qd_strdup(header);
-}
-#endif  // KAG_TODO
+        // send the out_data as a series of writes to proactor
 
+        while (od_len) {
 
-#if KAG_TODO
-static buffer_chain_t *buffer_chain()
-{
-    buffer_chain_t *chain = new_buffer_chain_t();
-    ZERO(chain);
-    DEQ_INIT(chain->blist);
-    return chain;
-}
+            size_t limit = MIN(RAW_BUFFER_BATCH, od_len);
+            int written = 0;
 
+            if (od->body_data) {  // buffers stored in qd_message_t
 
-static void buffer_chain_free(buffer_chain_t *chain)
-{
-    if (chain) {
-        assert(DEQ_SIZE(chain->blist) == 0);
-        free_buffer_chain_t(chain);
-    }
-}
-#endif  // KAG_TODO
+                written = qd_message_body_data_buffers(od->body_data, buffers, od->next_buffer, limit);
+                for (int i = 0; i < written; ++i)
+                    buffers[i].context = (uintptr_t)od;
 
+            } else {   // list of buffers in od->raw_buffers
 
-#if KAG_TODO
-static size_t replenish_read_buffs(qdr_http1_connection_t *conn)
-{
-    const size_t limit = MIN(pn_raw_connection_read_buffers_capacity(conn->raw_conn),
-                             DEQ_SIZE(conn->recv_buffers));
-    size_t count = 0;
-    pn_raw_buffer_t buffers[BUFF_BATCH];
-    while (count < limit) {
-        memset(buffers, 0, sizeof(buffers));
-        pn_raw_buffer_t *rdisc = &buffers[0];
-        size_t batch_ct = 0;
-        for (int i = 0; i < BUFF_BATCH; ++i) {
-            qd_buffer_t *buf = DEQ_HEAD(conn->recv_buffers);
-            assert(buf);
-            DEQ_REMOVE_HEAD(conn->recv_buffers);
+                // advance to next buffer to send in od
+                if (!wbuf) {
+                    wbuf = DEQ_HEAD(od->raw_buffers);
+                    for (int i = 0; i < od->next_buffer; ++i)
+                        wbuf = DEQ_NEXT(wbuf);
+                }
 
-            buf->size = 0;
-            rdisc->context  = (intptr_t)buf;
-            rdisc->bytes    = (char*) qd_buffer_base(buf);
-            rdisc->capacity = qd_buffer_capacity(buf);
-            //rdisc->size     = 0;
-            //rdisc->offset   = 0;
-            ++rdisc;
-
-            batch_ct += 1;
-            count += 1;
-            if (count == limit)
-                break;
-        }
-        fprintf(stderr, "Adding %d read buffers to %p\n", (int)batch_ct, (void*) conn);
-        pn_raw_connection_give_read_buffers(conn->raw_conn, buffers, batch_ct);
-    }
-    return count;
-}
-
-
-static size_t send_outgoing_buffs(tcp_conn_t *conn)
-{
-    pn_raw_buffer_t buffers[BUFF_BATCH];
-    size_t count = pn_raw_connection_write_buffers_capacity(conn->raw_conn);
-    count = MIN(count, conn->send_buffers.total);
-
-    // Since count ensures that we never run out of capacity or buffers
-    // to send we can avoid checking that on every loop
-
-    fprintf(stderr, "send_outgoing_buffs: %zu buffers\n", count);
-
-    while (count) {
-        pn_raw_buffer_t *rdisc = &buffers[0];
-        memset(buffers, 0, sizeof(buffers));
-
-        size_t batch_ct = 0;
-        size_t batch_limit = MIN(BUFF_BATCH, count);
-        buffer_chain_t  *chain = DEQ_HEAD(conn->send_buffers.chains);
-
-        fprintf(stderr, "  send_outgoing_buffs: %zu batch_limit\n", batch_limit);
-
-        while (batch_limit--) {
-
-            if (DEQ_SIZE(chain->blist) == 0) {
-                DEQ_REMOVE_HEAD(conn->send_buffers.chains);
-                buffer_chain_free(chain);
-                chain = DEQ_HEAD(conn->send_buffers.chains);
+                pn_raw_buffer_t *rdisc = &buffers[0];
+                while (limit--) {
+                    rdisc->context  = (uintptr_t)od;
+                    rdisc->bytes    = (char*) qd_buffer_base(wbuf);
+                    rdisc->size     = qd_buffer_size(wbuf);
+                    rdisc->offset   = 0;
+                    ++rdisc;
+                    wbuf = DEQ_NEXT(wbuf);
+                    written += 1;
+                }
             }
 
-            qd_buffer_t *buf = DEQ_HEAD(chain->blist);
-            DEQ_REMOVE_HEAD(chain->blist);
-
-            rdisc->context  = (intptr_t)buf;
-            rdisc->bytes    = (char*)qd_buffer_base(buf);
-            rdisc->size     = qd_buffer_size(buf) - chain->offset;
-            rdisc->offset   = chain->offset;
-            ++rdisc;
-
-            // all succeeding bufs have no offset
-            chain->offset = 0;
-
-            batch_ct += 1;
+            written = pn_raw_connection_write_buffers(hconn->raw_conn, buffers, written);
+            count -= written;
+            od_len -= written;
+            od->next_buffer += written;
         }
 
-        fprintf(stderr, "Adding %d write buffers to %p\n", (int)batch_ct, (void*) conn);
-        pn_raw_connection_write_buffers(conn->raw_conn, buffers, batch_ct);
-
-        assert(conn->send_buffers.total >= batch_ct);
-
-        conn->send_buffers.total -= batch_ct;
-        count -= batch_ct;
-
+        if (od->next_buffer == od->buffer_count) {
+            // move to next out_data
+            hconn->write_ptr = DEQ_NEXT(od);
+            wbuf = 0;
+        }
     }
-
-    return count;
 }
-#endif // KAG_TODO
 
+
+void qdr_http1_write_buffer_list(qdr_http1_connection_t *hconn, qd_buffer_list_t *blist)
+{
+    qdr_http1_out_data_t *od = new_qdr_http1_out_data_t();
+    ZERO(od);
+    od->raw_buffers = *blist;
+    od->buffer_count = (int) DEQ_SIZE(*blist);
+    DEQ_INIT(*blist);
+
+    DEQ_INSERT_TAIL(hconn->out_data, od);
+    if (!hconn->write_ptr)
+        hconn->write_ptr = od;
+
+    if (hconn->raw_conn && !pn_raw_connection_is_write_closed(hconn->raw_conn))
+        qdr_http1_write_flush(hconn);
+}
+
+
+void qdr_http1_write_body_data(qdr_http1_connection_t *hconn, qd_message_body_data_t *body_data)
+{
+    qdr_http1_out_data_t *od = new_qdr_http1_out_data_t();
+    ZERO(od);
+    od->body_data = body_data;
+    od->buffer_count = qd_message_body_data_buffer_count(body_data);
+
+    DEQ_INSERT_TAIL(hconn->out_data, od);
+    if (!hconn->write_ptr)
+        hconn->write_ptr = od;
+
+    if (hconn->raw_conn && !pn_raw_connection_is_write_closed(hconn->raw_conn))
+        qdr_http1_write_flush(hconn);
+}
+
+
+void qdr_http1_free_written_buffers(qdr_http1_connection_t *hconn)
+{
+    pn_raw_buffer_t buffers[RAW_BUFFER_BATCH];
+    size_t count;
+    while ((count = pn_raw_connection_take_written_buffers(hconn->raw_conn, buffers, RAW_BUFFER_BATCH)) != 0) {
+        for (size_t i = 0; i < count; ++i) {
+            qdr_http1_out_data_t *od = (qdr_http1_out_data_t*) buffers[i].context;
+            assert(od);
+
+            // Note: according to proton devs the order in which write buffers
+            // are released are NOT guaranteed to be in the same order in which
+            // they were written!
+
+            od->free_count += 1;
+            if (od->free_count == od->buffer_count) {
+                assert(od != hconn->write_ptr);  // error: w.p. not advanced?
+                DEQ_REMOVE(hconn->out_data, od);
+                if (od->body_data)
+                    qd_message_body_data_release(od->body_data);
+                else
+                    qd_buffer_list_free_buffers(&od->raw_buffers);
+                free_qdr_http1_out_data_t(od);
+            }
+        }
+    }
+}
 
 
 //
@@ -476,7 +453,7 @@ static void router_conn_trace(void *context, qdr_connection_t *conn, bool trace)
 //
 
 
-/*static*/ void qd_http1_adaptor_init(qdr_core_t *core, void **adaptor_context)
+static void qd_http1_adaptor_init(qdr_core_t *core, void **adaptor_context)
 {
     qdr_http1_adaptor_t *adaptor = NEW(qdr_http1_adaptor_t);
 
@@ -508,7 +485,7 @@ static void router_conn_trace(void *context, qdr_connection_t *conn, bool trace)
 }
 
 
-/*static*/ void qd_http1_adaptor_final(void *adaptor_context)
+static void qd_http1_adaptor_final(void *adaptor_context)
 {
     qdr_http1_adaptor_t *adaptor = (qdr_http1_adaptor_t*) adaptor_context;
     qdr_protocol_adaptor_free(adaptor->core, adaptor->adaptor);
@@ -520,5 +497,5 @@ static void router_conn_trace(void *context, qdr_connection_t *conn, bool trace)
 /**
  * Declare the adaptor so that it will self-register on process startup.
  */
-//QDR_CORE_ADAPTOR_DECLARE("http1.x-adaptor", qd_http1_adaptor_init, qd_http1_adaptor_final)
+QDR_CORE_ADAPTOR_DECLARE("http1.x-adaptor", qd_http1_adaptor_init, qd_http1_adaptor_final)
 

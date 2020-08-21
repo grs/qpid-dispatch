@@ -27,29 +27,26 @@
 #define REPLY_TO_CAPACITY 10
 #define LISTENER_BACKLOG  16
 
-// callbacks from HTTP1 decoder (incoming HTTP requests)
-static void client_tx_data_cb(h1_lib_connection_t *lib_hconn, qd_buffer_list_t *blist, size_t offset, unsigned int len);
-static int client_rx_request_cb(h1_lib_request_state_t *lib_rs,
-                                const char *method,
-                                const char *target,
-                                uint32_t version_major,
-                                uint32_t version_minor);
-static int client_rx_response_cb(h1_lib_request_state_t *lib_rs,
-                                 int status_code,
-                                 const char *reason_phrase,
+
+static void _client_tx_msg_headers_cb(h1_lib_connection_t *lib_hconn, qd_buffer_list_t *blist, unsigned int len);
+static void _client_tx_msg_body_cb(h1_lib_connection_t *lib_hconn, qd_message_body_data_t *body_data);
+static int _client_rx_request_cb(h1_lib_request_state_t *lib_rs,
+                                 const char *method,
+                                 const char *target,
                                  uint32_t version_major,
                                  uint32_t version_minor);
-static int client_rx_header_cb(h1_lib_request_state_t *lib_rs, const char *key, const char *value);
-static int client_rx_headers_done_cb(h1_lib_request_state_t *lib_rs, bool has_body);
-static int client_rx_body_cb(h1_lib_request_state_t *lib_rs, qd_buffer_list_t *body, size_t offset, uintmax_t len,
-                             bool more);
-static void client_rx_done_cb(h1_lib_request_state_t *lib_rs);
-static void client_request_complete_cb(h1_lib_request_state_t *lib_rs);
-
-static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void *context);
-
-
-
+static int _client_rx_response_cb(h1_lib_request_state_t *lib_rs,
+                                  int status_code,
+                                  const char *reason_phrase,
+                                  uint32_t version_major,
+                                  uint32_t version_minor);
+static int _client_rx_header_cb(h1_lib_request_state_t *lib_rs, const char *key, const char *value);
+static int _client_rx_headers_done_cb(h1_lib_request_state_t *lib_rs, bool has_body);
+static int _client_rx_body_cb(h1_lib_request_state_t *lib_rs, qd_buffer_list_t *body, size_t offset, uintmax_t len,
+                              bool more);
+static void _client_rx_done_cb(h1_lib_request_state_t *lib_rs);
+static void _client_request_complete_cb(h1_lib_request_state_t *lib_rs);
+static void _handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void *context);
 
 
 ////////////////////////////////////////////////////////
@@ -59,17 +56,17 @@ static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void
 
 // Listener received connection request from client
 //
-static void accept_client_connection(qd_http_lsnr_t *li)
+static void _accept_client_connection(qd_http_lsnr_t *li)
 {
     qdr_http1_connection_t *hconn = new_qdr_http1_connection_t();
 
     ZERO(hconn);
     hconn->type = HTTP1_CONN_CLIENT;
     hconn->qd_server = li->server;
-    hconn->handler_context.handler = &handle_connection_events;
+    hconn->handler_context.handler = &_handle_connection_events;
     hconn->handler_context.context = hconn;
 
-    DEQ_INIT(hconn->out_buffers);
+    DEQ_INIT(hconn->out_data);
 
     hconn->cfg.host = qd_strdup(li->config.host);
     hconn->cfg.port = qd_strdup(li->config.port);
@@ -83,14 +80,15 @@ static void accept_client_connection(qd_http_lsnr_t *li)
 
     h1_lib_conn_config_t config = {0};
     config.type             = HTTP1_CONN_CLIENT;
-    config.conn_tx_data     = client_tx_data_cb;
-    config.rx_request       = client_rx_request_cb;
-    config.rx_response      = client_rx_response_cb;
-    config.rx_header        = client_rx_header_cb;
-    config.rx_headers_done  = client_rx_headers_done_cb;
-    config.rx_body          = client_rx_body_cb;
-    config.rx_done          = client_rx_done_cb;
-    config.request_complete = client_request_complete_cb;
+    config.tx_msg_headers   = _client_tx_msg_headers_cb;
+    config.tx_msg_body      = _client_tx_msg_body_cb;
+    config.rx_request       = _client_rx_request_cb;
+    config.rx_response      = _client_rx_response_cb;
+    config.rx_header        = _client_rx_header_cb;
+    config.rx_headers_done  = _client_rx_headers_done_cb;
+    config.rx_body          = _client_rx_body_cb;
+    config.rx_done          = _client_rx_done_cb;
+    config.request_complete = _client_request_complete_cb;
 
     hconn->http_conn = h1_lib_connection(&config, hconn);
     if (!hconn->http_conn) {
@@ -107,7 +105,7 @@ static void accept_client_connection(qd_http_lsnr_t *li)
 
 // Process proactor events for the client listener
 //
-static void handle_listener_events(pn_event_t *e, qd_server_t *qd_server, void *context)
+static void _handle_listener_events(pn_event_t *e, qd_server_t *qd_server, void *context)
 {
     qd_log_source_t *log = qdr_http1_adaptor->log;
     qd_http_lsnr_t *li = (qd_http_lsnr_t*) context;
@@ -124,7 +122,7 @@ static void handle_listener_events(pn_event_t *e, qd_server_t *qd_server, void *
 
     case PN_LISTENER_ACCEPT: {
         qd_log(log, QD_LOG_INFO, "Accepting HTTP/1.x connection on %s", host_port);
-        accept_client_connection(li);
+        _accept_client_connection(li);
         break;
     }
 
@@ -140,7 +138,6 @@ static void handle_listener_events(pn_event_t *e, qd_server_t *qd_server, void *
             }
             pn_listener_set_context(li->pn_listener, 0);
             li->pn_listener = 0;
-            qd_http_listener_decref(li);
         }
         break;
     }
@@ -155,14 +152,14 @@ static void handle_listener_events(pn_event_t *e, qd_server_t *qd_server, void *
 //
 qd_http_lsnr_t *qd_http1_configure_listener(qd_dispatch_t *qd, const qd_http_bridge_config_t *config, qd_entity_t *entity)
 {
-    qd_http_lsnr_t *li = qd_http_lsnr(qd->server, &handle_listener_events);
+    qd_http_lsnr_t *li = qd_http_lsnr(qd->server, &_handle_listener_events);
     if (!li) {
         qd_log(qdr_http1_adaptor->log, QD_LOG_ERROR, "Unable to create http listener: no memory");
         return 0;
     }
     li->config = *config;
 
-    sys_atomic_inc(&li->ref_count); /* In use by proactor, PN_LISTENER_CLOSE will dec */
+    sys_atomic_inc(&li->ref_count);
     pn_proactor_listen(qd_server_proactor(li->server), li->pn_listener, li->config.host_port, LISTENER_BACKLOG);
     DEQ_ITEM_INIT(li);
     DEQ_INSERT_TAIL(qdr_http1_adaptor->listeners, li);
@@ -194,7 +191,7 @@ void qd_http1_delete_listener(qd_dispatch_t *qd, qd_http_lsnr_t *li)
 
 // Raw Connection Initialization
 //
-static void setup_client_connection(qdr_http1_connection_t *hconn)
+static void _setup_client_connection(qdr_http1_connection_t *hconn)
 {
     hconn->client.client_ip_addr = qda_raw_conn_get_address(hconn->raw_conn);
     qdr_connection_info_t *info = qdr_connection_info(false, //bool             is_encrypted,
@@ -268,7 +265,7 @@ static void setup_client_connection(qdr_http1_connection_t *hconn)
 
 // Proton Connection Event Handler
 //
-static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void *context)
+static void _handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void *context)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) context;
     qd_log_source_t *log = qdr_http1_adaptor->log;
@@ -278,7 +275,7 @@ static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void
     switch (pn_event_type(e)) {
 
     case PN_RAW_CONNECTION_CONNECTED: {
-        setup_client_connection(hconn);
+        _setup_client_connection(hconn);
         break;
     }
     case PN_RAW_CONNECTION_CLOSED_READ: {
@@ -296,13 +293,16 @@ static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void
         break;
     }
     case PN_RAW_CONNECTION_NEED_WRITE_BUFFERS: {
+        // processing the connection generates write buffers
         qd_log(log, QD_LOG_DEBUG, "[C%i] Need write buffers", hconn->conn_id);
         while (qdr_connection_process(hconn->qdr_conn)) {}
         break;
     }
     case PN_RAW_CONNECTION_NEED_READ_BUFFERS: {
         qd_log(log, QD_LOG_DEBUG, "[C%i] Need read buffers", hconn->conn_id);
-        while (qdr_connection_process(hconn->qdr_conn)) {}
+        if (hconn->in_link_credit > 0) {
+            qda_raw_conn_grant_read_buffers(hconn->raw_conn);
+        }
         break;
     }
     case PN_RAW_CONNECTION_WAKE: {
@@ -317,7 +317,7 @@ static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void
         qda_raw_conn_get_read_buffers(hconn->raw_conn, &blist, &length);
         int error = h1_lib_connection_rx_data(hconn->http_conn, &blist, length);
         if (error) abort();  // TODO(kgiusti) FIXME: drop conn
-        qda_raw_conn_grant_read_buffers(hconn->raw_conn);
+        //qda_raw_conn_grant_read_buffers(hconn->raw_conn);
         qd_log(log, QD_LOG_DEBUG, "[C%i] Read %"PRIuMAX" bytes", hconn->conn_id, length);
         while (qdr_connection_process(hconn->qdr_conn)) {}
         break;
@@ -340,10 +340,7 @@ static void handle_connection_events(pn_event_t *e, qd_server_t *qd_server, void
 ////////////////////////////////////////////////////////
 
 
-// Called when the encoder has data to send out the raw connection.  This will
-// take ownership of the buffer list and wake up the outgoing raw connection.
-//
-static void client_tx_data_cb(h1_lib_connection_t *hc, qd_buffer_list_t *blist, size_t offset, unsigned int len)
+static void _client_tx_msg_headers_cb(h1_lib_connection_t *hc, qd_buffer_list_t *blist, unsigned int len)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) h1_lib_connection_get_context(hc);
     if (!hconn->raw_conn) {
@@ -351,25 +348,36 @@ static void client_tx_data_cb(h1_lib_connection_t *hc, qd_buffer_list_t *blist, 
         qd_log(qdr_http1_adaptor->log, QD_LOG_WARNING,
                "[C%i] Discarding outgoing data - client connection closed", hconn->conn_id);
         qd_buffer_list_free_buffers(blist);
-    } else {
-        if (offset) {
-            qd_buffer_t *head = DEQ_HEAD(*blist);
-            memmove(qd_buffer_base(head), qd_buffer_base(head) + offset, qd_buffer_size(head));
-        }
-        DEQ_APPEND(hconn->out_buffers, *blist);
-        pn_raw_connection_wake(hconn->raw_conn);
+        return;
     }
+
+    qdr_http1_write_buffer_list(hconn, blist);
+}
+
+
+static void _client_tx_msg_body_cb(h1_lib_connection_t *hc, qd_message_body_data_t *body_data)
+{
+    qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) h1_lib_connection_get_context(hc);
+    if (!hconn->raw_conn) {
+        // client connection has been lost
+        qd_log(qdr_http1_adaptor->log, QD_LOG_WARNING,
+               "[C%i] Discarding outgoing data - client connection closed", hconn->conn_id);
+        qd_message_body_data_release(body_data);
+        return;
+    }
+
+    qdr_http1_write_body_data(hconn, body_data);
 }
 
 
 // Called when decoding an HTTP request from a client.  This indicates the
 // start of a new request message.
 //
-static int client_rx_request_cb(h1_lib_request_state_t *hrs,
-                                const char *method,
-                                const char *target,
-                                uint32_t version_major,
-                                uint32_t version_minor)
+static int _client_rx_request_cb(h1_lib_request_state_t *hrs,
+                                 const char *method,
+                                 const char *target,
+                                 uint32_t version_major,
+                                 uint32_t version_minor)
 {
     h1_lib_connection_t *h1c = h1_lib_request_state_get_connection(hrs);
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*)h1_lib_connection_get_context(h1c);
@@ -405,11 +413,11 @@ static int client_rx_request_cb(h1_lib_request_state_t *hrs,
 
 
 // Cannot happen for a client connection!
-static int client_rx_response_cb(h1_lib_request_state_t *hrs,
-                                   int status_code,
-                                   const char *reason_phrase,
-                                   uint32_t version_major,
-                                   uint32_t version_minor)
+static int _client_rx_response_cb(h1_lib_request_state_t *hrs,
+                                  int status_code,
+                                  const char *reason_phrase,
+                                  uint32_t version_major,
+                                  uint32_t version_minor)
 {
     return HTTP1_STATUS_BAD_REQ;
 }
@@ -417,7 +425,7 @@ static int client_rx_response_cb(h1_lib_request_state_t *hrs,
 
 // called for each decoded HTTP header.
 //
-static int client_rx_header_cb(h1_lib_request_state_t *hrs, const char *key, const char *value)
+static int _client_rx_header_cb(h1_lib_request_state_t *hrs, const char *key, const char *value)
 {
     qdr_http1_request_t *creq = (qdr_http1_request_t*) h1_lib_request_state_get_context(hrs);
 
@@ -440,9 +448,10 @@ static int client_rx_header_cb(h1_lib_request_state_t *hrs, const char *key, con
     return 0;
 }
 
+
 // called after the last header is decoded, before decoding any body data.
 //
-static int client_rx_headers_done_cb(h1_lib_request_state_t *hrs, bool has_body)
+static int _client_rx_headers_done_cb(h1_lib_request_state_t *hrs, bool has_body)
 {
     qdr_http1_request_t *creq = (qdr_http1_request_t*) h1_lib_request_state_get_context(hrs);
     qdr_http1_connection_t *hconn = creq->hconn;
@@ -472,10 +481,9 @@ static int client_rx_headers_done_cb(h1_lib_request_state_t *hrs, bool has_body)
     qd_message_compose_3(creq->request_msg, props, creq->app_props, !has_body);
 
     // send the message to the core for forwarding
-    assert(!creq->request_dlv);
-
     if (hconn->in_link_credit > 0) {
         creq->request_dlv = qdr_link_deliver(hconn->in_link, creq->request_msg, 0, false, 0, 0, 0, 0);
+        qdr_delivery_set_context(creq->request_dlv, (void*) creq);
     }
 
     return 0;
@@ -485,8 +493,8 @@ static int client_rx_headers_done_cb(h1_lib_request_state_t *hrs, bool has_body)
 // Called with decoded body data.  This may be called multiple times as body
 // data becomes available.
 //
-static int client_rx_body_cb(h1_lib_request_state_t *hrs, qd_buffer_list_t *body, size_t offset, size_t len,
-                             bool more)
+static int _client_rx_body_cb(h1_lib_request_state_t *hrs, qd_buffer_list_t *body, size_t offset, size_t len,
+                              bool more)
 {
     qdr_http1_request_t *creq = (qdr_http1_request_t*) h1_lib_request_state_get_context(hrs);
 
@@ -495,7 +503,7 @@ static int client_rx_body_cb(h1_lib_request_state_t *hrs, qd_buffer_list_t *body
         // Remove the offset by shifting the content of the head buffer forward
         //
         qd_buffer_t *head = DEQ_HEAD(*body);
-        memmove(qd_buffer_base(head), qd_buffer_base(head) + offset, qd_buffer_size(head));
+        memmove(qd_buffer_base(head), qd_buffer_base(head) + offset, qd_buffer_size(head) - offset);
     }
 
     //
@@ -522,10 +530,11 @@ static int client_rx_body_cb(h1_lib_request_state_t *hrs, qd_buffer_list_t *body
     return 0;
 }
 
+
 // Called at the completion of message decoding.  This indicates the message
 // has been completely decoded.  No further calls will occur for this message.
 //
-static void client_rx_done_cb(h1_lib_request_state_t *hrs)
+static void _client_rx_done_cb(h1_lib_request_state_t *hrs)
 {
     qdr_http1_request_t *creq = (qdr_http1_request_t*) h1_lib_request_state_get_context(hrs);
 
@@ -537,15 +546,14 @@ static void client_rx_done_cb(h1_lib_request_state_t *hrs)
     if (!qd_message_receive_complete(creq->request_msg)) {
         qd_message_set_receive_complete(creq->request_msg);
         if (creq->request_dlv) {
+            creq->hconn->in_link_credit -= 1;
             qdr_delivery_continue(qdr_http1_adaptor->core, creq->request_dlv, false);
         }
     }
-
-    creq->hconn->in_link_credit -= 1;
 }
 
 
-static void client_request_complete_cb(h1_lib_request_state_t *lib_rs)
+static void _client_request_complete_cb(h1_lib_request_state_t *lib_rs)
 {
     // TODO(kgiusti)
 }
@@ -565,43 +573,57 @@ void qdr_http1_client_link_flow(qdr_http1_adaptor_t    *adaptor,
 
     int old = hconn->in_link_credit;
     hconn->in_link_credit += credit;
-    if (old == 0 && hconn->in_link_credit > 0) {
-        qd_log(qdr_http1_adaptor->log, QD_LOG_DEBUG,
-               "[C%"PRIu64"][L%"PRIu64"] link unblocked", hconn->conn_id, link->identity);
+
+    if (hconn->in_link_credit > 0) {
 
         if (hconn->raw_conn && !pn_raw_connection_is_read_closed(hconn->raw_conn))
             qda_raw_conn_grant_read_buffers(hconn->raw_conn);
 
-        // check for pending request messages that can now be delivered to
-        // the router
-        while (hconn->in_link_credit > 0) {
-            qdr_http1_request_t *creq = DEQ_HEAD(hconn->requests);
-            if (!creq)
-                break;
+        if (old == 0) {
+            qd_log(adaptor->log, QD_LOG_DEBUG,
+                   "[C%"PRIu64"][L%"PRIu64"] link unblocked", hconn->conn_id, link->identity);
 
-            if (creq->request_msg && !creq->request_dlv) {
-                creq->request_dlv = qdr_link_deliver(hconn->in_link, creq->request_msg, 0, false, 0, 0, 0, 0);
-                if (qd_message_receive_complete(creq->request_msg)) {
-                    DEQ_REMOVE_HEAD(hconn->requests);
-                    // @TODO(kgiusti): settle? free?
-                    hconn->in_link_credit -= 1;
-                } else
+            // check for pending request messages that can now be delivered to
+            // the router
+            while (hconn->in_link_credit > 0) {
+                qdr_http1_request_t *creq = DEQ_HEAD(hconn->requests);
+                if (!creq)
                     break;
-            } else
-                break;
+
+                if (creq->request_msg && !creq->request_dlv) {
+                    // message pending delivery to router
+                    creq->request_dlv = qdr_link_deliver(hconn->in_link, creq->request_msg, 0, false, 0, 0, 0, 0);
+                    qdr_delivery_set_context(creq->request_dlv, (void*) creq);
+
+                    if (qd_message_receive_complete(creq->request_msg)) {
+                        hconn->in_link_credit -= 1;
+                    } else
+                        break;  // receive in progress
+                } else
+                    break;  // delivery in progress
+            }
         }
     }
 
-    // adjust the flow on the outgoing link so we keep the number of requests
-    // that can be sent to the server approximately the same as the number of
-    // responses the router will accept
+    // adjust the flow on the response link so we can accept as many responses
+    // as we're allowed requests.  Add extra to account for multiple
+    // "non-terminal" (code 1xx) responses for any one request.
+    credit *= 2;
     hconn->out_link_credit += credit;
-    qdr_link_flow(qdr_http1_adaptor->core, link, credit, false);  // will activate conn
+    qdr_link_flow(adaptor->core, link, credit, false);  // will activate conn
 }
 
 
-/*static*/ qdr_http1_request_t *lookup_request_context(qdr_http1_connection_t *hconn,
-                                                   qd_message_t *msg)
+//
+// Response message forwarding
+//
+
+
+// use the correlation ID from the AMQP message containing the response to look
+// up the original request context
+//
+static qdr_http1_request_t *_lookup_request_context(qdr_http1_connection_t *hconn,
+                                                    qd_message_t *msg)
 {
     qdr_http1_request_t *req = 0;
 
@@ -626,145 +648,95 @@ void qdr_http1_client_link_flow(qdr_http1_adaptor_t    *adaptor,
 }
 
 
-
-#ifdef KAG_TODO
-// Start a new response to the client.  msg has been validated to at least
-// application properties depth.
+// Send the response status and all HTTP headers to the client
 //
-static bool start_send_response(qdr_http1_request_t *req)
+static bool _send_response_headers(qdr_http1_request_t *req)
 {
+    bool ok = false;
     qd_message_t *msg = req->response_msg;
     qd_iterator_t *app_props_iter = qd_message_field_iterator(msg, QD_FIELD_APPLICATION_PROPERTIES);
-    qd_parsed_field_t *app_props = qd_parse(app_props_iter);
-    char *reason_str = 0;
-    bool rc = false;
-
-    if (!app_props || !qd_parse_is_map(app_props)) goto exit;
-
-    // extract the status code, version (optional), and reason (optional)
-
-    qd_parse_field_t *tmp = qd_parse_value_by_key(app_props, STATUS_HEADER_KEY);
-    if (!tmp) goto exit;
-
-    int32_t code = qd_parse_as_int(tmp);
-    if (!qd_parse_ok(tmp)) goto exit;
-
-    uint32_t major = 1;
-    uint32_t minor = 1;
-    tmp = qd_parse_value_by_key(app_props, RESPONSE_HEADER_KEY);
-    if (tmp) {
-        char *version_str = qd_iterator_copy(qd_parse_raw(tmp));
-        if (version_str) {
-            sscanf(version_str, "%"SCNu32".%"SCNu32, &major, &minor);
-            free(version_str);
-        }
-    }
-
-    tmp = qd_parse_value_by_key(app_props, REASON_HEADER_KEY);
-    if (tmp) {
-        reason_str = qd_iterator_copy(qd_parse_raw(tmp));
-    }
-
-    if (h1_lib_tx_response(req->lib_rs, (int)status_code, reason_str, major, minor))
-        goto exit;
-
-    // send all headers in app properties
-
-    qd_parsed_field_t *key = qd_field_first_child(app_props);
-    while (key) {
-        qd_parsed_field_t *value = qd_field_next_child(key);
-        if (!value)
-            break;
-
-        qd_iterator_t *i_key = qd_parse_raw(key);
-        if (!i_key)
-            break;
-
-        // ignore the special headers added by the mapping
-        if (!qd_iterator_prefix(ikey, HTTP1_HEADER_PREFIX)) {
-            qd_iterator_t *i_value = qd_parse_raw(value);
-            if (!i_value)
-                break;
-
-            char *header_key = qd_iterator_copy(i_key);
-            char *header_value = qd_iterator_copy(i_value);
-
-            int err = h1_lib_tx_add_header(req->lib_rs, header_key, header_value);
-
-            free(header_key);
-            free(header_value);
-
-            if (err) goto exit;
-        }
-
-        key = qd_field_next_child(value);
-    }
-
-    rc = true;  // success
-
-exit:
-
-    qd_iterator_free(app_props_iter);
-    qd_parse_free(app_props);
-    free(reason_str);
-
-    return rc;
-}
-
-
-static void send_request_headers(qdr_http1_server_response_t *resp)
-{
-    qd_iterator_t *app_props_iter = qd_message_field_iterator(resp->request_msg, QD_FIELD_APPLICATION_PROPERTIES);
     if (app_props_iter) {
         qd_parsed_field_t *app_props = qd_parse(app_props_iter);
         if (app_props && qd_parse_is_map(app_props)) {
-            qd_parsed_field_t *key = qd_field_first_child(app_props);
-            while (key) {
-                qd_parsed_field_t *value = qd_field_next_child(key);
-                if (!value)
-                    break;
+            qd_parsed_field_t *tmp = qd_parse_value_by_key(app_props, STATUS_HEADER_KEY);
+            if (tmp) {
+                int32_t status_code = qd_parse_as_int(tmp);
+                if (qd_parse_ok(tmp)) {
 
-                qd_iterator_t *i_key = qd_parse_raw(key);
-                if (!i_key)
-                    break;
+                    // the value for RESPONSE_HEADER_KEY is optional and is set
+                    // to a string representation of the version of the server
+                    // (e.g. "1.1"
+                    uint32_t major = 1;
+                    uint32_t minor = 1;
+                    tmp = qd_parse_value_by_key(app_props, RESPONSE_HEADER_KEY);
+                    if (tmp) {
+                        char *version_str = (char*) qd_iterator_copy(qd_parse_raw(tmp));
+                        if (version_str) {
+                            sscanf(version_str, "%"SCNu32".%"SCNu32, &major, &minor);
+                            free(version_str);
+                        }
+                    }
+                    char *reason_str = 0;
+                    tmp = qd_parse_value_by_key(app_props, REASON_HEADER_KEY);
+                    if (tmp) {
+                        reason_str = (char*) qd_iterator_copy(qd_parse_raw(tmp));
+                    }
 
-                // ignore the special headers added by the mapping
-                if (!qd_iterator_prefix(ikey, HTTP1_HEADER_PREFIX)) {
-                    qd_iterator_t *i_value = qd_parse_raw(value);
-                    if (!i_value)
-                        break;
+                    ok = !h1_lib_tx_response(req->lib_rs, (int)status_code, reason_str, major, minor);
+                    free(reason_str);
 
-                    char *header_key = qd_iterator_copy(i_key);
-                    char *header_value = qd_iterator_copy(i_value);
+                    // now send all headers in app properties
+                    qd_parsed_field_t *key = qd_field_first_child(app_props);
+                    while (ok && key) {
+                        qd_parsed_field_t *value = qd_field_next_child(key);
+                        if (!value)
+                            break;
 
-                    h1_lib_tx_add_header(resp->req_state, header_key, header_value);
+                        qd_iterator_t *i_key = qd_parse_raw(key);
+                        if (!i_key)
+                            break;
 
-                    free(header_key);
-                    free(header_value);
+                        // ignore the special headers added by the mapping
+                        if (!qd_iterator_prefix(i_key, HTTP1_HEADER_PREFIX)) {
+                            qd_iterator_t *i_value = qd_parse_raw(value);
+                            if (!i_value)
+                                break;
+
+                            char *header_key = (char*) qd_iterator_copy(i_key);
+                            char *header_value = (char*) qd_iterator_copy(i_value);
+
+                            ok = !h1_lib_tx_add_header(req->lib_rs, header_key, header_value);
+
+                            free(header_key);
+                            free(header_value);
+                        }
+
+                        key = qd_field_next_child(value);
+                    }
                 }
-
-                key = qd_field_next_child(value);
             }
         }
         qd_parse_free(app_props);
         qd_iterator_free(app_props_iter);
     }
+
+    return ok;
 }
 
-// helper routine to extract request body data from AMQP message and write it out to the server
+
+// helper routine to extract response body data from AMQP message and write it
+// out to the client.  Expected that message has been validated to BODY depth.
 //
-static uint64_t send_request_body(qdr_http1_server_response_t *resp)
+static uint64_t _send_response_body(qdr_http1_request_t *req)
 {
     qd_message_body_data_t        *body_data = 0;
 
     while (true) {
-        switch (qd_message_next_body_data(resp->request_msg, &body_data)) {
+        switch (qd_message_next_body_data(req->response_msg, &body_data)) {
         case QD_MESSAGE_BODY_DATA_OK: {
-            //
-            // We have a new valid body-data segment.  Handle it
-            //
-
-            // @TODO(kgiusti) - refactor HTTP1 library to handle body_data for output
+            if (h1_lib_tx_body(req->lib_rs, body_data)) {
+                // @TODO(kgiusti) handle error
+            }
             break;
         }
 
@@ -773,12 +745,11 @@ static uint64_t send_request_body(qdr_http1_server_response_t *resp)
             // We have already handled the last body-data segment for this delivery.
             // Complete the "sending" of this delivery and replenish credit.
             //
-            // Note that depending on the adaptor, it might be desirable to delay the
-            // acceptance and settlement of this delivery until a later event (i.e. when
-            // a requested action has completed).
-            //
-            qd_message_set_send_complete(msg);
-            qdr_link_flow(adaptor->core, link, 1, false);
+            qd_message_set_send_complete(req->response_msg);
+            h1_lib_tx_done(req->lib_rs);
+            // @TODO(kgiusti): per-request cleanup
+            // handle settlement
+            qdr_link_flow(qdr_http1_adaptor->core, req->hconn->out_link, 1, false);
             return PN_ACCEPTED; // This will cause the delivery to be settled
 
         case QD_MESSAGE_BODY_DATA_INCOMPLETE:
@@ -789,12 +760,13 @@ static uint64_t send_request_body(qdr_http1_server_response_t *resp)
 
         case QD_MESSAGE_BODY_DATA_INVALID:
         case QD_MESSAGE_BODY_DATA_NOT_DATA:
-            qdr_link_flow(adaptor->core, link, 1, false);
+            qdr_link_flow(qdr_http1_adaptor->core, req->hconn->out_link, 1, false);
+            // @TODO(kgiusti): how to recover from this?
             return PN_REJECTED;
         }
     }
 }
-#endif // KAG_TODO
+
 
 // The I/O thread wants to send this delivery out the link
 //
@@ -804,10 +776,7 @@ uint64_t qdr_http1_client_link_deliver(qdr_http1_adaptor_t    *adaptor,
                                        qdr_delivery_t         *delivery,
                                        bool                    settled)
 {
-#ifdef KAG_TODO
-
-    qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
-    qd_message_t             *msg = qdr_delivery_message(delivery);
+    qd_message_t *msg = qdr_delivery_message(delivery);
 
     qd_message_depth_status_t status = qd_message_check_depth(msg, QD_DEPTH_BODY);
     if (status == QD_MESSAGE_DEPTH_INCOMPLETE)
@@ -817,42 +786,46 @@ uint64_t qdr_http1_client_link_deliver(qdr_http1_adaptor_t    *adaptor,
         qd_log(qdr_http1_adaptor->log, QD_LOG_WARNING,
                "[C%"PRIu64"][L%"PRIu64"] Rejecting malformed message.", hconn->conn_id, link->identity);
         qdr_link_flow(qdr_http1_adaptor->core, link, 1, false);
+        // TODO(kgiusti): cancel response if in progress?  Cleanup??
         return PN_REJECTED;
     }
 
     assert(status == QD_MESSAGE_DEPTH_OK);
 
-    qdr_http1_client_request_t *req = qdr_delivery_get_context(delivery);
+    qdr_http1_request_t *req = (qdr_http1_request_t*) qdr_delivery_get_context(delivery);
     if (!req) {
-        // start of response, find corresponding request
-        req = lookup_request_context(hconn, msg);
+        // start of response message, find corresponding request
+        req = _lookup_request_context(hconn, msg);
         if (!req) {
             qd_log(qdr_http1_adaptor->log, QD_LOG_WARNING,
                    "[C%"PRIu64"][L%"PRIu64"] Rejecting malformed message.", hconn->conn_id, link->identity);
             qdr_link_flow(qdr_http1_adaptor->core, link, 1, false);
             return PN_REJECTED;
         }
+
+        assert(!req->response_dlv && !req->response_msg);
         req->response_dlv = delivery;
         req->response_msg = msg;
         qdr_delivery_set_context(delivery, req);
     }
 
-    if (req != DEQ_HEAD(hconn->request)) {
-        // responses must be sent back to the client in order...
-        not first cannot decode;  need to remember if headers etc sent!;
+    // Responses must be sent back to the client in the order in which the
+    // requests arrive.  Since a client can pipeline multiple requests
+    // which are then load balanced across multiple servers there is no
+    // guarantee that the responses will arrive in the correct order.
+    if (req != DEQ_HEAD(hconn->requests)) {
+        return 0;  // try again later
     }
 
-    if (!start_send_response(req)) {
-
+    if (!req->headers_sent) {
+        if (!_send_response_headers(req)) {
+            // @TODO: how to best handle invalid responses??
+            return PN_REJECTED;
+        }
+        req->headers_sent = true;
     }
 
-    uint64_t outcome = send_response_body(req);
-    if (outcome == PN_REJECTED) {
-        // cleanup
-        // drop connection??
-    }
-#endif  // KAG_TODO
-    return 0;
+    return _send_response_body(req);
 }
 
 

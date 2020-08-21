@@ -62,18 +62,28 @@ typedef struct scratch_memory_t {
 } scratch_memory_t;
 
 
-// state for a single request-response transaction
+// State for a single request-response transaction.
+//
+// A new state is created when a request starts (either via the rx_request
+// callback in the case of client connections or the h1_lib_tx_request() call
+// for server connections).
+//
+// For a connection to a server the rx_response callbacks will occur in the same
+// order as h1_lib_tx_request calls are made.
+//
+// For a connection to a client the caller must ensure that calls to
+// h1_lib_tx_response() must be made in the same order as rx_request callbacks
+// occur.
 //
 struct h1_lib_request_state_t {
     DEQ_LINKS(struct h1_lib_request_state_t);
-    void         *context;
+    void                *context;
     h1_lib_connection_t *conn;
-    uint32_t      response_code;
-    char         *method;
+    char                *method;
+    uint32_t             response_code;
 
     bool close_on_done;     // true if connection must be closed when response completes
-    bool is_head_method;    // true if request method is HEAD
-    bool is_connect_method; // true if request method is CONNECT TODO(kgiusti): supported?
+    bool no_body_method;    // true if request method is either HEAD or CONNECT
 };
 DEQ_DECLARE(h1_lib_request_state_t, h1_lib_request_state_list_t);
 ALLOC_DECLARE(h1_lib_request_state_t);
@@ -142,7 +152,7 @@ struct h1_lib_connection_t {
         h1_lib_request_state_t *hrs;           // current request/response state
 
         bool is_request;
-        bool crlf_sent;    // true if the CRLF after headers has been sent
+        bool headers_sent;  // true after all headers have been sent
     } encoder;
 
     h1_lib_conn_config_t config;
@@ -273,7 +283,7 @@ static void encoder_reset(struct encoder_t *encoder)
     // do not touch the write_ptr or the outgoing queue as there may be more messages to send.
     encoder->hrs = 0;
     encoder->is_request = false;
-    encoder->crlf_sent = false;
+    encoder->headers_sent = false;
 }
 
 
@@ -568,10 +578,8 @@ static bool parse_request_line(h1_lib_connection_t *conn, struct decoder_t *deco
     h1_lib_request_state_t *hrs = h1_lib_request_state(conn);
 
     // check for methods that do not support body content in the response:
-    if (strcmp((char*)method_str, "HEAD") == 0)
-        hrs->is_head_method = true;
-    else if (strcmp((char*)method_str, "CONNECT") == 0)
-        hrs->is_connect_method = true;
+    hrs->no_body_method = (strcmp((char*)method_str, "HEAD") == 0 ||
+                           strcmp((char*)method_str, "CONNECT") == 0);
 
     hrs->method = qd_strdup((char*) method_str);
 
@@ -742,8 +750,7 @@ static bool process_headers_done(h1_lib_connection_t *conn, struct decoder_t *de
         // and the message body is terminated by closing the connection.
         //
         h1_lib_request_state_t *hrs = decoder->hrs;
-        has_body = !(hrs->is_head_method       ||
-                     hrs->is_connect_method    ||
+        has_body = !(hrs->no_body_method       ||
                      hrs->response_code == 204 ||     // No Content
                      hrs->response_code == 205 ||     // Reset Content
                      hrs->response_code == 304 ||     // Not Modified
@@ -1241,12 +1248,13 @@ h1_lib_request_state_t *h1_lib_tx_request(h1_lib_connection_t *conn, const char 
 
     h1_lib_request_state_t *hrs = encoder->hrs = h1_lib_request_state(conn);
     encoder->is_request = true;
-    encoder->crlf_sent = false;
+    encoder->headers_sent = false;
 
-    if (strcmp((char*)method, "HEAD") == 0)
-        hrs->is_head_method = true;
-    else if (strcmp((char*)method, "CONNECT") == 0)
-        hrs->is_connect_method = true;
+    hrs->method = qd_strdup(method);
+
+    // check for methods that do not support body content in the response:
+    hrs->no_body_method = (strcmp((char*)method, "HEAD") == 0 ||
+                           strcmp((char*)method, "CONNECT") == 0);
 
     write_string(encoder, method);
     write_string(encoder, " ");
@@ -1281,7 +1289,7 @@ int h1_lib_tx_response(h1_lib_request_state_t *hrs, int status_code, const char 
 
     encoder->hrs = hrs;
     encoder->is_request = false;
-    encoder->crlf_sent = false;
+    encoder->headers_sent = false;
     hrs->response_code = status_code;
 
     {
@@ -1332,37 +1340,40 @@ int h1_lib_tx_add_header(h1_lib_request_state_t *hrs, const char *key, const cha
         octets += qd_buffer_size(buf);
     }
     if (!DEQ_IS_EMPTY(blist))
-        conn->config.conn_tx_data(conn, &blist, 0, octets);
+        conn->config.tx_msg_headers(conn, &blist, octets);
 
     return 0;
 }
 
 
-// just forward the body chain along
-int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_buffer_list_t *data, size_t offset, size_t len)
+static inline void _flush_headers(h1_lib_connection_t *conn, struct encoder_t *encoder)
 {
-    h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
-    struct encoder_t *encoder = &conn->encoder;
-
-    fprintf(stderr, "h1_lib_tx_body(offset=%zu size=%zu)\n", offset, len);
-    
-    if (!encoder->crlf_sent) {
+    if (!encoder->headers_sent) {
         // need to terminate any headers by sending the plain CRLF that follows
         // the headers
         write_string(encoder, CRLF);
 
         // flush all pending output.  From this point out the outgoing queue is
         // no longer used for this message
-        fprintf(stderr, "Flushing before body: %u bytes\n", qd_buffer_list_length(&encoder->outgoing));
-        conn->config.conn_tx_data(conn, &encoder->outgoing, 0, qd_buffer_list_length(&encoder->outgoing));
+        conn->config.tx_msg_headers(conn, &encoder->outgoing, qd_buffer_list_length(&encoder->outgoing));
         DEQ_INIT(encoder->outgoing);
         encoder->write_ptr = NULL_I_PTR;
-        encoder->crlf_sent = true;
+        encoder->headers_sent = true;
     }
+}
+
+
+// just forward the body chain along
+int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_message_body_data_t *body_data)
+{
+    h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
+    struct encoder_t *encoder = &conn->encoder;
+
+    if (!encoder->headers_sent)
+        _flush_headers(conn, encoder);
 
     // skip the outgoing queue and send directly
-    fprintf(stderr, "Sending body data %zu bytes\n", len);
-    conn->config.conn_tx_data(conn, data, offset, len);
+    conn->config.tx_msg_body(conn, body_data);
 
     return 0;
 }
@@ -1373,18 +1384,8 @@ int h1_lib_tx_done(h1_lib_request_state_t *hrs)
     h1_lib_connection_t *conn = h1_lib_request_state_get_connection(hrs);
     struct encoder_t *encoder = &conn->encoder;
 
-    if (!encoder->crlf_sent) {
-        // need to send the plain CRLF that follows the headers
-        write_string(encoder, CRLF);
-
-        // flush all pending output.
-
-        fprintf(stderr, "Flushing at tx_done: %u bytes\n", qd_buffer_list_length(&encoder->outgoing));
-        conn->config.conn_tx_data(conn, &encoder->outgoing, 0, qd_buffer_list_length(&encoder->outgoing));
-        DEQ_INIT(encoder->outgoing);
-        encoder->write_ptr = NULL_I_PTR;
-        encoder->crlf_sent = true;
-    }
+    if (!encoder->headers_sent)
+        _flush_headers(conn, encoder);
 
     bool is_response = !encoder->is_request;
     encoder_reset(encoder);
