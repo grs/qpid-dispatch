@@ -27,15 +27,16 @@
 //
 char *qda_raw_conn_get_address(pn_raw_connection_t *socket);
 
-// read all available incoming data buffers from the raw connection
-// return the result in blist, with the total number of read octets in *length
+// Retrieve all available incoming data buffers from the raw connection.
+// Return the result in blist, with the total number of read octets in *length
+// Note: only those buffers containing data (size != 0) are returned.
 //
 void qda_raw_conn_get_read_buffers(pn_raw_connection_t *conn, qd_buffer_list_t *blist, uintmax_t *length);
 
 // allocate empty read buffers to the raw connection.  This will provide enough buffers
-// to fill the connections capacity
+// to fill the connections capacity.  Returns the number of buffers granted.
 //
-void qda_raw_conn_grant_read_buffers(pn_raw_connection_t *conn);
+int qda_raw_conn_grant_read_buffers(pn_raw_connection_t *conn);
 
 
 // Write blist buffers to the connection.  Buffers are removed from the HEAD of

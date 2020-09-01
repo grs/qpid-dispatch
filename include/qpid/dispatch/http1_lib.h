@@ -65,6 +65,7 @@ typedef enum {
     HTTP1_STATUS_BAD_REQ = 400,
     HTTP1_STATUS_SERVER_ERR = 500,
     HTTP1_STATUS_BAD_VERSION = 505,
+    HTTP1_STATUS_SERVICE_UNAVAILABLE = 503,
 } h1_lib_status_code_t;
 
 typedef struct h1_lib_conn_config_t {
@@ -79,17 +80,21 @@ typedef struct h1_lib_conn_config_t {
     // of the buffer list and must release the buffers when done.  len is set
     // to the total octets of data in the list.
     //
-    void (*tx_msg_headers)(h1_lib_connection_t *conn, qd_buffer_list_t *data, unsigned int len);
+    void (*tx_msg_headers)(h1_lib_request_state_t *hrs, qd_buffer_list_t *data, unsigned int len);
 
     // tx_msg_body()
     // Called with outgoing body_data after all headers have been sent.  Only
     // called if the outgoing HTTP message has a body. The caller assumes
     // ownership of the body_data and must release it when done.
     //
-    void (*tx_msg_body)(h1_lib_connection_t *conn, qd_message_body_data_t *body_data);
+    void (*tx_msg_body)(h1_lib_request_state_t *hrs, qd_message_body_data_t *body_data);
 
     //
     // RX message callbacks
+    //
+    // These callbacks should return 0 on success or non-zero on error.  A
+    // non-zero return code is used as the return code from
+    // h1_lib_connection_rx_data()
     //
 
     // HTTP request received - new h1_lib_request_state_t created (hrs).  This
@@ -119,22 +124,31 @@ typedef struct h1_lib_conn_config_t {
 
     int (*rx_body)(h1_lib_request_state_t *hrs, qd_buffer_list_t *body, size_t offset, uintmax_t len, bool more);
 
+    // Invoked after a received HTTP message has been completely parsed.
+    //
     void (*rx_done)(h1_lib_request_state_t *hrs);
 
-    // Invoked when the request/response(s) exchange has completed.  The
-    // h1_lib_request_state_t instance (hrs) is no longer valid on return from
-    // this call so all context assoicated with hrs must be released during
-    // this call.
-    //
-    void (*request_complete)(h1_lib_request_state_t *hrs);
+    // Invoked when the final response message has been decoded (server
+    // connection) or encoded (client connection), or the request has been cancelled.
+    // hrs is freed on return from this callback and must not be referenced further.
+    void (*request_complete)(h1_lib_request_state_t *hrs,
+                             bool cancelled);
+
 } h1_lib_conn_config_t;
 
 
 h1_lib_connection_t *h1_lib_connection(h1_lib_conn_config_t *config, void *context);
-void h1_lib_connection_close(h1_lib_connection_t *conn);
 void *h1_lib_connection_get_context(h1_lib_connection_t *conn);
 
-// push inbound network data into the http1 library
+// Close the connection.  The connection pointed to by conn and all outstanding
+// h1_lib_request_state_t handles are freed on return from this call.
+// The rx_done() callback will occur for any requests 
+//
+void h1_lib_connection_close(h1_lib_connection_t *conn);
+
+// Push inbound network data into the http1 library.  The return value is zero on success.
+// All rx_*() callbacks occur during this call.
+//
 int h1_lib_connection_rx_data(h1_lib_connection_t *conn, qd_buffer_list_t *data, uintmax_t len);
 
 
@@ -142,23 +156,33 @@ void h1_lib_request_state_set_context(h1_lib_request_state_t *hrs, void *context
 void *h1_lib_request_state_get_context(const h1_lib_request_state_t *hrs);
 h1_lib_connection_t *h1_lib_request_state_get_connection(const h1_lib_request_state_t *hrs);
 
+// Cancel the request.  The h1_lib_request_state_t is freed during this call.
+// The request_complete callback will be invoked during this call with
+// cancelled=True.
+//
+void h1_lib_request_state_cancel(h1_lib_request_state_t *hrs);
+
 const char *h1_lib_request_state_method(const h1_lib_request_state_t *hrs);
 //const char *h1_lib_request_state_target(const h1_lib_request_state_t *hrs);
 //bool h1_lib_request_state_request_version(const h1_lib_request_state_t *hrs, int *major, int *minor);
 
 
-
 //
 // API for sending HTTP/1.x messages
+//
+// The tx_msg_headers and tx_msg_body callbacks can occur during any of these
+// calls.
 //
 
 
 // initiate a request - this creates a new request state context
+//
 h1_lib_request_state_t *h1_lib_tx_request(h1_lib_connection_t *conn, const char *method, const char *target,
                                           uint32_t version_major, uint32_t version_minor);
 
-// respond to a received request - the request state context should be the one
-// supplied during the corresponding rx_request callback
+// Respond to a received request - the request state context should be the one
+// supplied during the corresponding rx_request callback.  It is required that
+// the caller issues responses in the same order as requests arrive.
 //
 int h1_lib_tx_response(h1_lib_request_state_t *hrs, int status_code, const char *reason_phrase,
                        uint32_t version_major, uint32_t version_minor);
@@ -171,7 +195,9 @@ int h1_lib_tx_add_header(h1_lib_request_state_t *hrs, const char *key, const cha
 //
 int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_message_body_data_t *body_data);
 
-// outgoing message construction complete
+// outgoing message construction complete.  The request_complete() callback MAY
+// occur during this call.
+//
 int h1_lib_tx_done(h1_lib_request_state_t *hrs);
 
 

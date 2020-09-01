@@ -50,11 +50,14 @@ void qda_raw_conn_get_read_buffers(pn_raw_connection_t *conn, qd_buffer_list_t *
         for (size_t i = 0; i < n; ++i) {
             qd_buffer_t *qd_buf = (qd_buffer_t*)buffs[i].context;
             assert(qd_buf);
-
-            // set content length:
-            qd_buffer_insert(qd_buf, buffs[i].size);
-            len += buffs[i].size;
-            DEQ_INSERT_TAIL(*blist, qd_buf);
+            if (buffs[i].size) {
+                // set content length:
+                qd_buffer_insert(qd_buf, buffs[i].size);
+                len += buffs[i].size;
+                DEQ_INSERT_TAIL(*blist, qd_buf);
+            } else {  // ignore empty buffers
+                qd_buffer_free(qd_buf);
+            }
         }
     }
 
@@ -62,9 +65,13 @@ void qda_raw_conn_get_read_buffers(pn_raw_connection_t *conn, qd_buffer_list_t *
 }
 
 
-void qda_raw_conn_grant_read_buffers(pn_raw_connection_t *conn)
+int qda_raw_conn_grant_read_buffers(pn_raw_connection_t *conn)
 {
     pn_raw_buffer_t buffs[RAW_BUFFER_BATCH];
+    if (pn_raw_connection_is_read_closed(conn))
+        return 0;
+
+    int granted = 0;
     size_t count = pn_raw_connection_read_buffers_capacity(conn);
     while (count) {
         size_t batch_ct = 0;
@@ -79,7 +86,10 @@ void qda_raw_conn_grant_read_buffers(pn_raw_connection_t *conn)
                 break;
         }
         pn_raw_connection_give_read_buffers(conn, buffs, batch_ct);
+        granted += batch_ct;
     }
+
+    return granted;
 }
 
 

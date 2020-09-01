@@ -84,6 +84,8 @@ struct h1_lib_request_state_t {
 
     bool close_on_done;     // true if connection must be closed when response completes
     bool no_body_method;    // true if request method is either HEAD or CONNECT
+    bool request_complete;  // true when request message done encoding/decoding
+    bool response_complete; // true when response message done encoding/decoding
 };
 DEQ_DECLARE(h1_lib_request_state_t, h1_lib_request_state_list_t);
 ALLOC_DECLARE(h1_lib_request_state_t);
@@ -117,11 +119,11 @@ struct h1_lib_connection_t {
         qd_iterator_pointer_t  read_ptr;
         qd_iterator_pointer_t  body_ptr;
 
-        h1_lib_request_state_t  *hrs;            // current request/response
-        http1_msg_state_t      state;
-        scratch_memory_t       scratch;
-        int                    error;
-        const char            *error_msg;
+        h1_lib_request_state_t *hrs;            // current request/response
+        http1_msg_state_t       state;
+        scratch_memory_t        scratch;
+        const char             *error_msg;
+        int                     error;
 
         uint64_t               content_length;
         http1_chunk_state_t    chunk_state;
@@ -219,21 +221,26 @@ void h1_lib_connection_close(h1_lib_connection_t *conn)
 {
     if (conn) {
         struct decoder_t *decoder = &conn->decoder;
-        if (!decoder->error) {
-            if (decoder->state == HTTP1_MSG_STATE_BODY
-                && decoder->hrs) {
-
-                // terminate the incoming message as the server has closed the
-                // connection to indicate the end of the message
-                conn->config.rx_done(decoder->hrs);
+        if (conn->config.type == HTTP1_CONN_SERVER && decoder->hrs) {
+            if (!decoder->error) {
+                // The server may have closed the connection to indicate the response has completed.
+                // If that is the case consider this request complete
+                if (decoder->hrs->request_complete && decoder->hrs->response_code) {
+                    decoder->hrs->response_complete = true;
+                    conn->config.rx_done(decoder->hrs);
+                    conn->config.request_complete(decoder->hrs, false);
+                    h1_lib_request_state_free(decoder->hrs);  // removes from conn->hrs_queue
+                    decoder->hrs = 0;
+                }
             }
+        }
 
-            // notify any outstanding requests
-            h1_lib_request_state_t *hrs = DEQ_HEAD(conn->hrs_queue);
-            while (hrs) {
-                conn->config.request_complete(hrs);
-                hrs = DEQ_NEXT(hrs);
-            }
+        // notify any outstanding requests that they have been cancelled
+        h1_lib_request_state_t *hrs = DEQ_HEAD(conn->hrs_queue);
+        while (hrs) {
+            conn->config.request_complete(hrs, true);
+            h1_lib_request_state_free(hrs);  // removes from conn->hrs_queue
+            hrs = DEQ_HEAD(conn->hrs_queue);
         }
 
         decoder_reset(&conn->decoder);
@@ -241,12 +248,6 @@ void h1_lib_connection_close(h1_lib_connection_t *conn)
         qd_buffer_list_free_buffers(&conn->decoder.incoming);
         qd_buffer_list_free_buffers(&conn->encoder.outgoing);
         free(conn->decoder.scratch.buf);
-
-        h1_lib_request_state_t *hrs = DEQ_HEAD(conn->hrs_queue);
-        while (hrs) {
-            h1_lib_request_state_free(hrs);  // removes from conn->hrs_queue
-            hrs = DEQ_HEAD(conn->hrs_queue);
-        }
 
         free_h1_lib_connection_t(conn);
     }
@@ -1126,19 +1127,22 @@ static bool parse_done(h1_lib_connection_t *conn, struct decoder_t *decoder)
 
     if (!decoder->error) {
         // signal the message receive is complete
-        conn->config.rx_done(hrs);
-
-        if (is_response) {   // request<->response transfer complete
-
+        //conn->config.rx_done(hrs);
+        if (is_response) {
             // Informational 1xx response codes are NOT teriminal - further responses are allowed!
             if (IS_INFO_RESPONSE(hrs->response_code)) {
                 hrs->response_code = 0;
             } else {
-                // The message exchange is complete
-                conn->config.request_complete(hrs);
-                decoder->hrs = 0;
-                h1_lib_request_state_free(hrs);
+                hrs->response_complete = true;
             }
+        } else {
+            hrs->request_complete = true;
+        }
+
+        if (hrs->request_complete && hrs->response_complete) {
+            conn->config.request_complete(hrs, false);
+            decoder->hrs = 0;
+            h1_lib_request_state_free(hrs);
         }
 
         decoder_reset(decoder);
@@ -1233,6 +1237,22 @@ h1_lib_connection_t *h1_lib_request_state_get_connection(const h1_lib_request_st
 const char *h1_lib_request_state_method(const h1_lib_request_state_t *hrs)
 {
     return hrs->method;
+}
+
+
+void h1_lib_request_state_cancel(h1_lib_request_state_t *hrs)
+{
+    if (hrs) {
+        h1_lib_connection_t *conn = hrs->conn;
+        conn->config.request_complete(hrs, true);
+        if (hrs == conn->decoder.hrs) {
+            decoder_reset(&conn->decoder);
+        }
+        if (hrs == conn->encoder.hrs) {
+            encoder_reset(&conn->encoder);
+        }
+        h1_lib_request_state_free(hrs);
+    }
 }
 
 
@@ -1340,13 +1360,13 @@ int h1_lib_tx_add_header(h1_lib_request_state_t *hrs, const char *key, const cha
         octets += qd_buffer_size(buf);
     }
     if (!DEQ_IS_EMPTY(blist))
-        conn->config.tx_msg_headers(conn, &blist, octets);
+        conn->config.tx_msg_headers(hrs, &blist, octets);
 
     return 0;
 }
 
 
-static inline void _flush_headers(h1_lib_connection_t *conn, struct encoder_t *encoder)
+static inline void _flush_headers(h1_lib_request_state_t *hrs, struct encoder_t *encoder)
 {
     if (!encoder->headers_sent) {
         // need to terminate any headers by sending the plain CRLF that follows
@@ -1355,7 +1375,7 @@ static inline void _flush_headers(h1_lib_connection_t *conn, struct encoder_t *e
 
         // flush all pending output.  From this point out the outgoing queue is
         // no longer used for this message
-        conn->config.tx_msg_headers(conn, &encoder->outgoing, qd_buffer_list_length(&encoder->outgoing));
+        hrs->conn->config.tx_msg_headers(hrs, &encoder->outgoing, qd_buffer_list_length(&encoder->outgoing));
         DEQ_INIT(encoder->outgoing);
         encoder->write_ptr = NULL_I_PTR;
         encoder->headers_sent = true;
@@ -1370,10 +1390,10 @@ int h1_lib_tx_body(h1_lib_request_state_t *hrs, qd_message_body_data_t *body_dat
     struct encoder_t *encoder = &conn->encoder;
 
     if (!encoder->headers_sent)
-        _flush_headers(conn, encoder);
+        _flush_headers(hrs, encoder);
 
     // skip the outgoing queue and send directly
-    conn->config.tx_msg_body(conn, body_data);
+    conn->config.tx_msg_body(hrs, body_data);
 
     return 0;
 }
@@ -1385,7 +1405,7 @@ int h1_lib_tx_done(h1_lib_request_state_t *hrs)
     struct encoder_t *encoder = &conn->encoder;
 
     if (!encoder->headers_sent)
-        _flush_headers(conn, encoder);
+        _flush_headers(hrs, encoder);
 
     bool is_response = !encoder->is_request;
     encoder_reset(encoder);
@@ -1396,10 +1416,15 @@ int h1_lib_tx_done(h1_lib_request_state_t *hrs)
             // for this request so just reset the transfer state
             hrs->response_code = 0;
         } else {
-            // The message exchange is complete
-            conn->config.request_complete(hrs);
-            h1_lib_request_state_free(hrs);
+            hrs->response_complete = true;
         }
+    } else {
+        hrs->request_complete = true;
+    }
+
+    if (hrs->request_complete && hrs->response_complete) {
+        conn->config.request_complete(hrs, false);
+        h1_lib_request_state_free(hrs);
     }
 
     return 0;

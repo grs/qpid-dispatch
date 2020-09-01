@@ -25,74 +25,30 @@
 #define RAW_BUFFER_BATCH  16
 
 
-////////////////////////////////////////
-// TODO:
-// * Deal with serializing the responses in the case of pipelined requests
-//
-
-
 /*
-  HTTP/1.x <--> AMQP message mapping as defined by OASIS HTTP Over AMQP draft v1.0
-
-  Projected Mode
-  --------------
+  HTTP/1.x <--> AMQP message mapping
 
   Message Properties Section:
 
   HTTP Message                  AMQP Message Properties
   ------------                  -----------------------
-  Request Method                subject
-  Response Status               subject
-  Request Target                to
-  Content-Type                  content-type
-  Content-Encoding              content-encoding
-  Date                          creation-time
-  From                          user-id
-  Expires                       absolute-expiry-time
+  Request Method                subject field
 
   Application Properties Section:
 
-  HTTP Message                  AMQP Message App Properties
-  ------------                  ---------------------------
+  HTTP Message                  AMQP Message App Properties Map
+  ------------                  -------------------------------
   Request Version               "http:request": "<version|1.1 default>"
   Response Version              "http:response": "<version|1.1 default>"
+  Response Status Code          "http:status": <int32>
   Response Reason               "http:reason": <string>
+  Request Target                "http:target": <string>
   *                             "<lowercase(key)>" <string>
 
   Notes:
-   - Message App Properties Keys that start with ":" are reserved by the
-  adaptor for meta-data.
-   - OASIS insists the following headers MUST NOT be carried over:
-       - TE
-       - Trailer
-       - Transfer-Encoding
-       - Content-Length
-       - Via
-       - Connection
-       - Upgrade
-
-       however the adaptor does not modify the body encoding in any way so
-       Content-Length and Tranfer-Encoding ARE going to be sent exactly as they
-       are received.
-   - The Connection header is a PITA.  Not only must it be parsed to determine
-     if the sender is requesting that the TCP connection is closed when the
-     response is complete, but it also *may* specify additional headers that
-     must be filtered out.
+   - Message App Properties Keys that start with "http:" are reserved by the
+     adaptor for meta-data.
  */
-
-
-
-// A list of buffers containing data that starts at offset octets into
-// the head buffer
-//
-typedef struct buffer_chain_t {
-    DEQ_LINKS(struct buffer_chain_t);
-    qd_buffer_list_t blist;
-    size_t           offset;
-} buffer_chain_t;
-DEQ_DECLARE(buffer_chain_t, buffer_chain_list_t);
-ALLOC_DECLARE(buffer_chain_t);
-ALLOC_DEFINE(buffer_chain_t);
 
 ALLOC_DEFINE(qdr_http1_request_t);
 ALLOC_DEFINE(qdr_http1_out_data_t);
@@ -102,28 +58,159 @@ ALLOC_DEFINE(qdr_http1_connection_t);
 qdr_http1_adaptor_t *qdr_http1_adaptor;
 
 
+void qdr_http1_request_free(qdr_http1_request_t *hreq)
+{
+    if (hreq) {
+        DEQ_REMOVE(hreq->hconn->requests, hreq);
+
+        if (hreq->lib_rs)
+            h1_lib_request_state_cancel(hreq->lib_rs);
+        free(hreq->response_addr);
+
+        assert(!hreq->request_dlv);
+        assert(!hreq->response_dlv);
+
+        if (hreq->app_props)
+            qd_compose_free(hreq->app_props);
+
+        if (hreq->in_msg)
+            qd_message_free(hreq->in_msg);
+
+        qd_compose_free(hreq->app_props);
+
+        qdr_http1_out_data_t *od = DEQ_HEAD(hreq->out_data);
+        while (od) {
+            DEQ_REMOVE_HEAD(hreq->out_data);
+            if (DEQ_SIZE(od->raw_buffers))
+                qd_buffer_list_free_buffers(&od->raw_buffers);
+            if (od->body_data) {
+                qd_message_body_data_release(od->body_data);
+            }
+            free_qdr_http1_out_data_t(od);
+            od = DEQ_HEAD(hreq->out_data);
+        }
+
+        free_qdr_http1_request_t(hreq);
+    }
+}
+
+
+void qdr_http1_connection_free(qdr_http1_connection_t *hconn)
+{
+    if (hconn) {
+        assert(!hconn->raw_conn);  // assumed
+
+        qdr_http1_request_t *req = DEQ_HEAD(hconn->requests);
+        while (req) {
+            qdr_http1_request_free(req);
+            req = DEQ_HEAD(hconn->requests);
+        }
+
+        free(hconn->server.activate_timer);
+        if (hconn->qdr_conn) {
+            qdr_connection_set_context(hconn->qdr_conn, 0);
+            qdr_connection_closed(hconn->qdr_conn);
+        }
+        h1_lib_connection_close(hconn->http_conn);
+        free(hconn->cfg.host);
+        free(hconn->cfg.port);
+        free(hconn->cfg.address);
+        free(hconn->cfg.host_port);
+
+        free(hconn->client.client_ip_addr);
+        free(hconn->client.reply_to_addr);
+
+        free_qdr_http1_connection_t(hconn);
+    }
+}
+
+
+void qdr_http1_close_connection(qdr_http1_connection_t *hconn, const char *error)
+{
+    if (error) {
+        qd_log(qdr_http1_adaptor->log, QD_LOG_ERROR,
+               "[C%"PRIu64"] Connection closing: %s", hconn->conn_id, error);
+    }
+
+    hconn->close_connection = true;
+    if (hconn->raw_conn) {
+        pn_raw_connection_close(hconn->raw_conn);
+    }
+
+    // clean up all connection related stuff on PN_RAW_CONNECTION_DISCONNECTED
+    // event
+}
+
+
+void qdr_http1_rejected_response(qdr_http1_request_t *hreq,
+                                 const qdr_error_t *error)
+{
+    char *reason = 0;
+    if (error) {
+        size_t len = 0;
+        char *ename = qdr_error_name(error);
+        char *edesc = qdr_error_description(error);
+        if (ename) len += strlen(ename);
+        if (edesc) len += strlen(edesc);
+        if (len) {
+            reason = qd_malloc(len + 2);
+            reason[0] = 0;
+            if (ename) {
+                strcat(reason, ename);
+                strcat(reason, " ");
+            }
+            if (edesc)
+                strcat(reason, edesc);
+        }
+        free(ename);
+        free(edesc);
+    }
+
+    qdr_http1_error_response(hreq, HTTP1_STATUS_BAD_REQ,
+                             reason ? reason : "Invalid Request");
+    free(reason);
+}
+
+
+void qdr_http1_error_response(qdr_http1_request_t *hreq,
+                              int error_code,
+                              const char *reason)
+{
+    // expected to be called when no response is expected to arrive (request
+    // failed, PN_REJECTED, etc) otherwise attempting to send 2 responses?
+    assert(!hreq->response_dlv);
+    if (hreq->lib_rs) {
+        h1_lib_tx_response(hreq->lib_rs, error_code, reason, 1, 1);
+        h1_lib_tx_done(hreq->lib_rs);
+    }
+}
+
 //
 // Raw Connection Write Buffer Management
 //
 
 
-void qdr_http1_write_flush(qdr_http1_connection_t *hconn)
+// Write pending data out the raw connection
+//
+void qdr_http1_write_out_data(qdr_http1_request_t *hreq)
 {
     pn_raw_buffer_t buffers[RAW_BUFFER_BATCH];
-    size_t count = pn_raw_connection_write_buffers_capacity(hconn->raw_conn);
+    qdr_http1_connection_t *hconn = hreq->hconn;
+    size_t count = pn_raw_connection_is_write_closed(hconn->raw_conn)
+        ? 0
+        : pn_raw_connection_write_buffers_capacity(hconn->raw_conn);
 
-    while (count > 0 && hconn->write_ptr) {
 
-        qdr_http1_out_data_t *od     = hconn->write_ptr;
-        qd_buffer_t          *wbuf   = 0;
-        int                   od_len = MIN(count,
-                                           (od->buffer_count - od->next_buffer));
-        assert(od_len);  // error: no data @ write_ptr?
+    qdr_http1_out_data_t *od = DEQ_HEAD(hreq->out_data);
+    while (count > 0 && od) {
+        qd_buffer_t *wbuf   = 0;
+        int          od_len = MIN(count,
+                                  (od->buffer_count - od->next_buffer));
+        assert(od_len);  // error: no data @ head?
 
         // send the out_data as a series of writes to proactor
 
         while (od_len) {
-
             size_t limit = MIN(RAW_BUFFER_BATCH, od_len);
             int written = 0;
 
@@ -161,15 +248,19 @@ void qdr_http1_write_flush(qdr_http1_connection_t *hconn)
         }
 
         if (od->next_buffer == od->buffer_count) {
-            // move to next out_data
-            hconn->write_ptr = DEQ_NEXT(od);
+            // all buffers sent, advance.  We free the out_data instance once
+            // all buffers are released by the proactor
+            DEQ_REMOVE_HEAD(hreq->out_data);
+            od = DEQ_HEAD(hreq->out_data);
             wbuf = 0;
         }
     }
 }
 
 
-void qdr_http1_write_buffer_list(qdr_http1_connection_t *hconn, qd_buffer_list_t *blist)
+// The HTTP encoder has a list of buffers to be written to the raw connection
+//
+void qdr_http1_write_buffer_list(qdr_http1_request_t *hreq, qd_buffer_list_t *blist)
 {
     qdr_http1_out_data_t *od = new_qdr_http1_out_data_t();
     ZERO(od);
@@ -177,31 +268,31 @@ void qdr_http1_write_buffer_list(qdr_http1_connection_t *hconn, qd_buffer_list_t
     od->buffer_count = (int) DEQ_SIZE(*blist);
     DEQ_INIT(*blist);
 
-    DEQ_INSERT_TAIL(hconn->out_data, od);
-    if (!hconn->write_ptr)
-        hconn->write_ptr = od;
+    od->hreq = hreq;
+    DEQ_INSERT_TAIL(hreq->out_data, od);
 
-    if (hconn->raw_conn && !pn_raw_connection_is_write_closed(hconn->raw_conn))
-        qdr_http1_write_flush(hconn);
+    qdr_http1_write_out_data(hreq);
 }
 
 
-void qdr_http1_write_body_data(qdr_http1_connection_t *hconn, qd_message_body_data_t *body_data)
+// The HTTP encoder has a message body data to be written to the raw connection
+//
+void qdr_http1_write_body_data(qdr_http1_request_t *hreq, qd_message_body_data_t *body_data)
 {
     qdr_http1_out_data_t *od = new_qdr_http1_out_data_t();
     ZERO(od);
     od->body_data = body_data;
     od->buffer_count = qd_message_body_data_buffer_count(body_data);
 
-    DEQ_INSERT_TAIL(hconn->out_data, od);
-    if (!hconn->write_ptr)
-        hconn->write_ptr = od;
+    od->hreq = hreq;
+    DEQ_INSERT_TAIL(hreq->out_data, od);
 
-    if (hconn->raw_conn && !pn_raw_connection_is_write_closed(hconn->raw_conn))
-        qdr_http1_write_flush(hconn);
+    qdr_http1_write_out_data(hreq);
 }
 
 
+// Called during proactor event PN_RAW_CONNECTION_WRITTEN
+//
 void qdr_http1_free_written_buffers(qdr_http1_connection_t *hconn)
 {
     pn_raw_buffer_t buffers[RAW_BUFFER_BATCH];
@@ -210,15 +301,13 @@ void qdr_http1_free_written_buffers(qdr_http1_connection_t *hconn)
         for (size_t i = 0; i < count; ++i) {
             qdr_http1_out_data_t *od = (qdr_http1_out_data_t*) buffers[i].context;
             assert(od);
-
             // Note: according to proton devs the order in which write buffers
             // are released are NOT guaranteed to be in the same order in which
             // they were written!
 
             od->free_count += 1;
             if (od->free_count == od->buffer_count) {
-                assert(od != hconn->write_ptr);  // error: w.p. not advanced?
-                DEQ_REMOVE(hconn->out_data, od);
+                // all buffers returned
                 if (od->body_data)
                     qd_message_body_data_release(od->body_data);
                 else
@@ -301,6 +390,11 @@ static void router_link_detach(void *context, qdr_link_t *link, qdr_error_t *err
     if (hconn) {
         qd_log(qdr_http1_adaptor->log, QD_LOG_DEBUG,
                "[C%"PRIu64"][L%"PRIu64"] Link detach", hconn->conn_id, link->identity);
+        if (link == hconn->out_link)
+            hconn->out_link = 0;
+        else
+            hconn->in_link = 0;
+        qdr_http1_close_connection(hconn, 0);
     }
 }
 
@@ -429,9 +523,12 @@ static void router_conn_close(void *context, qdr_connection_t *conn, qdr_error_t
             qd_log(qdr_http1_adaptor->log, QD_LOG_TRACE,
                    "[C%"PRIu64"] HTTP/1.x closing connection", hconn->conn_id);
 
-        hconn->close_connection = true;
-        if (hconn->raw_conn)
-            pn_raw_connection_wake(hconn->raw_conn);
+        char *qdr_error = error ? qdr_error_description(error) : 0;
+        hconn->qdr_conn = 0;
+        hconn->out_link = 0;
+        hconn->in_link = 0;
+        qdr_http1_close_connection(hconn, qdr_error);
+        free(qdr_error);
     }
 }
 
@@ -489,10 +586,11 @@ static void qd_http1_adaptor_final(void *adaptor_context)
 {
     qdr_http1_adaptor_t *adaptor = (qdr_http1_adaptor_t*) adaptor_context;
     qdr_protocol_adaptor_free(adaptor->core, adaptor->adaptor);
-    // @TODO(kgiusti) clean up
+    // @TODO(kgiusti): proper clean up
     free(adaptor);
     qdr_http1_adaptor =  NULL;
 }
+
 
 /**
  * Declare the adaptor so that it will self-register on process startup.
