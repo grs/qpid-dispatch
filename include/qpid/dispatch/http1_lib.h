@@ -35,8 +35,8 @@
 // of the HTTP/1.x message are parsed.
 //
 // The encoder allows the application to construct an HTTP/1.x message. An API
-// is provided for building the message and a callback is invoked when the
-// encoder has full qd_buffer_t data to send out the TCP connection.
+// is provided for building the message and callbacks are invoked when the
+// encoder has full qd_buffer_t or body_data to send out the TCP connection.
 //
 // This library provides two classes:
 //
@@ -47,6 +47,7 @@
 //   HTTP/1.x Request <-> Response message exchange. Multiple
 //   h1_lib_request_state_t can be associated with an h1_lib_connection_t due to
 //   request pipelining.
+//
 
 
 #define HTTP1_VERSION_1_1  "HTTP/1.1"
@@ -61,6 +62,7 @@ typedef enum {
     HTTP1_CONN_SERVER,  // connection to server
 } h1_lib_conn_type_t;
 
+
 typedef enum {
     HTTP1_STATUS_BAD_REQ = 400,
     HTTP1_STATUS_SERVER_ERR = 500,
@@ -68,11 +70,13 @@ typedef enum {
     HTTP1_STATUS_SERVICE_UNAVAILABLE = 503,
 } h1_lib_status_code_t;
 
+
 typedef struct h1_lib_conn_config_t {
 
     h1_lib_conn_type_t type;
 
-    // Callbacks to send data out the raw connection.
+    // Callbacks to send data out the raw connection.  These callbacks
+    // are triggered by the message creation API (h1_lib_tx_*)
 
     // tx_msg_headers()
     // Send HTTP status and header lines.  This may be called multiple times as
@@ -142,7 +146,7 @@ void *h1_lib_connection_get_context(h1_lib_connection_t *conn);
 
 // Close the connection.  The connection pointed to by conn and all outstanding
 // h1_lib_request_state_t handles are freed on return from this call.
-// The rx_done() callback will occur for any requests 
+// The rx_done() callback will occur for any requests
 //
 void h1_lib_connection_close(h1_lib_connection_t *conn);
 

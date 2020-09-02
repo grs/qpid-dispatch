@@ -50,6 +50,9 @@
      adaptor for meta-data.
  */
 
+// @TODO(kgiusti): rx complete + abort ingress deliveries when endpoint dies while msg in flight
+
+
 ALLOC_DEFINE(qdr_http1_request_t);
 ALLOC_DEFINE(qdr_http1_out_data_t);
 ALLOC_DEFINE(qdr_http1_connection_t);
@@ -326,7 +329,7 @@ void qdr_http1_free_written_buffers(qdr_http1_connection_t *hconn)
 
 // Invoked by the core thread to wake an I/O thread for the connection
 //
-static void router_connection_activate_CT(void *context, qdr_connection_t *conn)
+static void _core_connection_activate_CT(void *context, qdr_connection_t *conn)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_connection_get_context(conn);
     if (!hconn) return;
@@ -350,12 +353,12 @@ static void router_connection_activate_CT(void *context, qdr_connection_t *conn)
 }
 
 
-static void router_link_first_attach(void               *context,
-                                     qdr_connection_t   *conn,
-                                     qdr_link_t         *link,
-                                     qdr_terminus_t     *source,
-                                     qdr_terminus_t     *target,
-                                     qd_session_class_t  ssn_class)
+static void _core_link_first_attach(void               *context,
+                                    qdr_connection_t   *conn,
+                                    qdr_link_t         *link,
+                                    qdr_terminus_t     *source,
+                                    qdr_terminus_t     *target,
+                                    qd_session_class_t  ssn_class)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_connection_get_context(conn);
     if (hconn)
@@ -363,7 +366,7 @@ static void router_link_first_attach(void               *context,
 }
 
 
-static void router_link_second_attach(void          *context,
+static void _core_link_second_attach(void          *context,
                                      qdr_link_t     *link,
                                      qdr_terminus_t *source,
                                      qdr_terminus_t *target)
@@ -384,7 +387,7 @@ static void router_link_second_attach(void          *context,
 }
 
 
-static void router_link_detach(void *context, qdr_link_t *link, qdr_error_t *error, bool first, bool close)
+static void _core_link_detach(void *context, qdr_link_t *link, qdr_error_t *error, bool first, bool close)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     if (hconn) {
@@ -399,7 +402,7 @@ static void router_link_detach(void *context, qdr_link_t *link, qdr_error_t *err
 }
 
 
-static void router_link_flow(void *context, qdr_link_t *link, int credit)
+static void _core_link_flow(void *context, qdr_link_t *link, int credit)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     if (hconn) {
@@ -407,14 +410,14 @@ static void router_link_flow(void *context, qdr_link_t *link, int credit)
                "[C%"PRIu64"][L%"PRIu64"] Link flow (%d)",
                hconn->conn_id, link->identity, credit);
         if (hconn->type == HTTP1_CONN_SERVER)
-            qdr_http1_server_link_flow((qdr_http1_adaptor_t*) context, hconn, link, credit);
+            qdr_http1_server_core_link_flow((qdr_http1_adaptor_t*) context, hconn, link, credit);
         else
-            qdr_http1_client_link_flow((qdr_http1_adaptor_t*) context, hconn, link, credit);
+            qdr_http1_client_core_link_flow((qdr_http1_adaptor_t*) context, hconn, link, credit);
     }
 }
 
 
-static void router_link_offer(void *context, qdr_link_t *link, int delivery_count)
+static void _core_link_offer(void *context, qdr_link_t *link, int delivery_count)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     if (hconn) {
@@ -425,7 +428,7 @@ static void router_link_offer(void *context, qdr_link_t *link, int delivery_coun
 }
 
 
-static void router_link_drained(void *context, qdr_link_t *link)
+static void _core_link_drained(void *context, qdr_link_t *link)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     if (hconn) {
@@ -436,7 +439,7 @@ static void router_link_drained(void *context, qdr_link_t *link)
 }
 
 
-static void router_link_drain(void *context, qdr_link_t *link, bool mode)
+static void _core_link_drain(void *context, qdr_link_t *link, bool mode)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     if (hconn) {
@@ -448,7 +451,7 @@ static void router_link_drain(void *context, qdr_link_t *link, bool mode)
 }
 
 
-static int router_link_push(void *context, qdr_link_t *link, int limit)
+static int _core_link_push(void *context, qdr_link_t *link, int limit)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     if (hconn) {
@@ -462,7 +465,7 @@ static int router_link_push(void *context, qdr_link_t *link, int limit)
 
 // The I/O thread wants to send this delivery out the link
 //
-static uint64_t router_link_deliver(void *context, qdr_link_t *link, qdr_delivery_t *delivery, bool settled)
+static uint64_t _core_link_deliver(void *context, qdr_link_t *link, qdr_delivery_t *delivery, bool settled)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     uint64_t outcome = PN_RELEASED;
@@ -473,15 +476,15 @@ static uint64_t router_link_deliver(void *context, qdr_link_t *link, qdr_deliver
                (void*)delivery, settled ? "settled" : "unsettled");
 
         if (hconn->type == HTTP1_CONN_SERVER)
-            outcome = qdr_http1_server_link_deliver(qdr_http1_adaptor, hconn, link, delivery, settled);
+            outcome = qdr_http1_server_core_link_deliver(qdr_http1_adaptor, hconn, link, delivery, settled);
         else
-            outcome = qdr_http1_client_link_deliver(qdr_http1_adaptor, hconn, link, delivery, settled);
+            outcome = qdr_http1_client_core_link_deliver(qdr_http1_adaptor, hconn, link, delivery, settled);
     }
 
     return outcome;
 }
 
-static int router_link_get_credit(void *context, qdr_link_t *link)
+static int _core_link_get_credit(void *context, qdr_link_t *link)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_link_get_context(link);
     int credit = 0;
@@ -497,7 +500,7 @@ static int router_link_get_credit(void *context, qdr_link_t *link)
 
 // Handle disposition/settlement update for the outstanding incoming HTTP message
 //
-static void router_delivery_update(void *context, qdr_delivery_t *dlv, uint64_t disp, bool settled)
+static void _core_delivery_update(void *context, qdr_delivery_t *dlv, uint64_t disp, bool settled)
 {
     qdr_http1_request_t *hreq = (qdr_http1_request_t*) qdr_delivery_get_context(dlv);
     if (hreq) {
@@ -509,13 +512,13 @@ static void router_delivery_update(void *context, qdr_delivery_t *dlv, uint64_t 
                settled ? "settled" : "unsettled");
 
         if (hconn->type == HTTP1_CONN_SERVER)
-            qdr_http1_server_delivery_update(qdr_http1_adaptor, hconn, hreq, dlv, disp, settled);
+            qdr_http1_server_core_delivery_update(qdr_http1_adaptor, hconn, hreq, dlv, disp, settled);
         else
-            qdr_http1_client_delivery_update(qdr_http1_adaptor, hconn, hreq, dlv, disp, settled);
+            qdr_http1_client_core_delivery_update(qdr_http1_adaptor, hconn, hreq, dlv, disp, settled);
     }
 }
 
-static void router_conn_close(void *context, qdr_connection_t *conn, qdr_error_t *error)
+static void _core_conn_close(void *context, qdr_connection_t *conn, qdr_error_t *error)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_connection_get_context(conn);
     if (hconn) {
@@ -533,7 +536,7 @@ static void router_conn_close(void *context, qdr_connection_t *conn, qdr_error_t
 }
 
 
-static void router_conn_trace(void *context, qdr_connection_t *conn, bool trace)
+static void _core_conn_trace(void *context, qdr_connection_t *conn, bool trace)
 {
     qdr_http1_connection_t *hconn = (qdr_http1_connection_t*) qdr_connection_get_context(conn);
     if (hconn) {
@@ -559,20 +562,20 @@ static void qd_http1_adaptor_init(qdr_core_t *core, void **adaptor_context)
     adaptor->adaptor = qdr_protocol_adaptor(core,
                                             "http/1.x",
                                             adaptor,             // context
-                                            router_connection_activate_CT,  // core thread only
-                                            router_link_first_attach,
-                                            router_link_second_attach,
-                                            router_link_detach,
-                                            router_link_flow,
-                                            router_link_offer,
-                                            router_link_drained,
-                                            router_link_drain,
-                                            router_link_push,
-                                            router_link_deliver,
-                                            router_link_get_credit,
-                                            router_delivery_update,
-                                            router_conn_close,
-                                            router_conn_trace);
+                                            _core_connection_activate_CT,  // core thread only
+                                            _core_link_first_attach,
+                                            _core_link_second_attach,
+                                            _core_link_detach,
+                                            _core_link_flow,
+                                            _core_link_offer,
+                                            _core_link_drained,
+                                            _core_link_drain,
+                                            _core_link_push,
+                                            _core_link_deliver,
+                                            _core_link_get_credit,
+                                            _core_delivery_update,
+                                            _core_conn_close,
+                                            _core_conn_trace);
     adaptor->log = qd_log_source(QD_HTTP_LOG_SOURCE);
     DEQ_INIT(adaptor->listeners);
     DEQ_INIT(adaptor->connectors);

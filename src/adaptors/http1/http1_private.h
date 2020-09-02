@@ -208,39 +208,39 @@ void qdr_http1_rejected_response(qdr_http1_request_t *hreq,
 
 // http1_client.c protocol adaptor callbacks
 //
-void qdr_http1_client_link_flow(qdr_http1_adaptor_t    *adaptor,
-                                qdr_http1_connection_t *hconn,
-                                qdr_link_t             *link,
-                                int                     credit);
-uint64_t qdr_http1_client_link_deliver(qdr_http1_adaptor_t    *adaptor,
-                                       qdr_http1_connection_t *hconn,
-                                       qdr_link_t             *link,
-                                       qdr_delivery_t         *delivery,
-                                       bool                    settled);
-void qdr_http1_client_delivery_update(qdr_http1_adaptor_t *adaptor,
-                                      qdr_http1_connection_t *hconn,
-                                      qdr_http1_request_t    *hreq,
-                                      qdr_delivery_t         *dlv,
-                                      uint64_t                disp,
-                                      bool                    settled);
+void qdr_http1_client_core_link_flow(qdr_http1_adaptor_t    *adaptor,
+                                     qdr_http1_connection_t *hconn,
+                                     qdr_link_t             *link,
+                                     int                     credit);
+uint64_t qdr_http1_client_core_link_deliver(qdr_http1_adaptor_t    *adaptor,
+                                            qdr_http1_connection_t *hconn,
+                                            qdr_link_t             *link,
+                                            qdr_delivery_t         *delivery,
+                                            bool                    settled);
+void qdr_http1_client_core_delivery_update(qdr_http1_adaptor_t *adaptor,
+                                           qdr_http1_connection_t *hconn,
+                                           qdr_http1_request_t    *hreq,
+                                           qdr_delivery_t         *dlv,
+                                           uint64_t                disp,
+                                           bool                    settled);
 
 
 // http1_server.c protocol adaptor callbacks
 //
-void qdr_http1_server_link_flow(qdr_http1_adaptor_t    *adaptor,
-                                qdr_http1_connection_t *hconn,
-                                qdr_link_t             *link,
-                                int                     credit);
-uint64_t qdr_http1_server_link_deliver(qdr_http1_adaptor_t    *adaptor,
-                                       qdr_http1_connection_t *hconn,
-                                       qdr_link_t             *link,
-                                       qdr_delivery_t         *delivery,
-                                       bool                    settled);
-void qdr_http1_server_delivery_update(qdr_http1_adaptor_t *adaptor,
-                                      qdr_http1_connection_t *hconn,
-                                      qdr_http1_request_t    *hreq,
-                                      qdr_delivery_t         *dlv,
-                                      uint64_t                disp,
-                                      bool                    settled);
+void qdr_http1_server_core_link_flow(qdr_http1_adaptor_t    *adaptor,
+                                     qdr_http1_connection_t *hconn,
+                                     qdr_link_t             *link,
+                                     int                     credit);
+uint64_t qdr_http1_server_core_link_deliver(qdr_http1_adaptor_t    *adaptor,
+                                            qdr_http1_connection_t *hconn,
+                                            qdr_link_t             *link,
+                                            qdr_delivery_t         *delivery,
+                                            bool                    settled);
+void qdr_http1_server_core_delivery_update(qdr_http1_adaptor_t *adaptor,
+                                           qdr_http1_connection_t *hconn,
+                                           qdr_http1_request_t    *hreq,
+                                           qdr_delivery_t         *dlv,
+                                           uint64_t                disp,
+                                           bool                    settled);
 
 #endif // http1_private_H

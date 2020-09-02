@@ -634,10 +634,10 @@ static void _server_request_complete_cb(h1_lib_request_state_t *hrs, bool cancel
 // credit has been granted - responses may now be sent to the
 // router core.
 //
-void qdr_http1_server_link_flow(qdr_http1_adaptor_t    *adaptor,
-                                qdr_http1_connection_t *hconn,
-                                qdr_link_t             *link,
-                                int                     credit)
+void qdr_http1_server_core_link_flow(qdr_http1_adaptor_t    *adaptor,
+                                     qdr_http1_connection_t *hconn,
+                                     qdr_link_t             *link,
+                                     int                     credit)
 {
     assert(link == hconn->in_link);   // router only grants flow on incoming link
 
@@ -671,12 +671,12 @@ void qdr_http1_server_link_flow(qdr_http1_adaptor_t    *adaptor,
 // Regardless of error now is when the response delivery can be
 // settled
 //
-void qdr_http1_server_delivery_update(qdr_http1_adaptor_t    *adaptor,
-                                      qdr_http1_connection_t *hconn,
-                                      qdr_http1_request_t    *hreq,
-                                      qdr_delivery_t         *dlv,
-                                      uint64_t                disp,
-                                      bool                    settled)
+void qdr_http1_server_core_delivery_update(qdr_http1_adaptor_t    *adaptor,
+                                           qdr_http1_connection_t *hconn,
+                                           qdr_http1_request_t    *hreq,
+                                           qdr_delivery_t         *dlv,
+                                           uint64_t                disp,
+                                           bool                    settled)
 {
     qd_message_t *msg = qdr_delivery_message(dlv);
     assert(dlv == hreq->response_dlv);
@@ -883,11 +883,11 @@ static uint64_t _decode_request_message(qdr_http1_request_t *hreq)
 // start of a new incoming HTTP request or the continuation of an existing one.
 // Note: returning a non-zero value will cause the delivery to be settled!
 //
-uint64_t qdr_http1_server_link_deliver(qdr_http1_adaptor_t    *adaptor,
-                                       qdr_http1_connection_t *hconn,
-                                       qdr_link_t             *link,
-                                       qdr_delivery_t         *delivery,
-                                       bool                    settled)
+uint64_t qdr_http1_server_core_link_deliver(qdr_http1_adaptor_t    *adaptor,
+                                            qdr_http1_connection_t *hconn,
+                                            qdr_link_t             *link,
+                                            qdr_delivery_t         *delivery,
+                                            bool                    settled)
 {
     qd_message_t *msg = qdr_delivery_message(delivery);
     qdr_http1_request_t *hreq = (qdr_http1_request_t*) qdr_delivery_get_context(delivery);

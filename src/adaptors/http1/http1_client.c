@@ -693,10 +693,10 @@ static void _client_request_complete_cb(h1_lib_request_state_t *lib_rs, bool can
 //////////////////////////////////////////////////////////////////////
 
 
-void qdr_http1_client_link_flow(qdr_http1_adaptor_t    *adaptor,
-                                qdr_http1_connection_t *hconn,
-                                qdr_link_t             *link,
-                                int                     credit)
+void qdr_http1_client_core_link_flow(qdr_http1_adaptor_t    *adaptor,
+                                     qdr_http1_connection_t *hconn,
+                                     qdr_link_t             *link,
+                                     int                     credit)
 {
     assert(link == hconn->in_link);   // router only grants flow on incoming link
 
@@ -730,12 +730,12 @@ void qdr_http1_client_link_flow(qdr_http1_adaptor_t    *adaptor,
 
 // Handle disposition/settlement update for the outstanding request msg
 //
-void qdr_http1_client_delivery_update(qdr_http1_adaptor_t    *adaptor,
-                                      qdr_http1_connection_t *hconn,
-                                      qdr_http1_request_t    *hreq,
-                                      qdr_delivery_t         *dlv,
-                                      uint64_t                disp,
-                                      bool                    settled)
+void qdr_http1_client_core_delivery_update(qdr_http1_adaptor_t    *adaptor,
+                                           qdr_http1_connection_t *hconn,
+                                           qdr_http1_request_t    *hreq,
+                                           qdr_delivery_t         *dlv,
+                                           uint64_t                disp,
+                                           bool                    settled)
 {
     qd_message_t *msg = qdr_delivery_message(dlv);
     assert(dlv == hreq->request_dlv);
@@ -924,11 +924,11 @@ static uint64_t _decode_response_message(qdr_http1_request_t *hreq)
 
 // The I/O thread wants to send this delivery out the link
 //
-uint64_t qdr_http1_client_link_deliver(qdr_http1_adaptor_t    *adaptor,
-                                       qdr_http1_connection_t *hconn,
-                                       qdr_link_t             *link,
-                                       qdr_delivery_t         *delivery,
-                                       bool                    settled)
+uint64_t qdr_http1_client_core_link_deliver(qdr_http1_adaptor_t    *adaptor,
+                                            qdr_http1_connection_t *hconn,
+                                            qdr_link_t             *link,
+                                            qdr_delivery_t         *delivery,
+                                            bool                    settled)
 {
     qd_message_t        *msg = qdr_delivery_message(delivery);
     qdr_http1_request_t *req = (qdr_http1_request_t*) qdr_delivery_get_context(delivery);
