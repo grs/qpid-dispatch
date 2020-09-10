@@ -41,7 +41,6 @@ typedef struct qdr_http1_connection_t    qdr_http1_connection_t;
 
 DEQ_DECLARE(qdr_http1_connection_t, qdr_http1_connection_list_t);
 
-
 typedef struct qdr_http1_adaptor_t {
     qdr_core_t                  *core;
     qdr_protocol_adaptor_t      *adaptor;
@@ -111,6 +110,9 @@ struct qdr_http1_request_base_t {
     h1_codec_request_state_t *lib_rs;
     qdr_http1_connection_t   *hconn;  // parent connection
     char                     *response_addr; // request reply-to
+    char                     *site;
+    qd_timestamp_t            start;
+    qd_timestamp_t            stop;
 
     // statistics
     //
@@ -138,6 +140,7 @@ struct qdr_http1_connection_t {
         char *host;
         char *port;
         char *address;
+        char *site;
         char *host_port;
     } cfg;
 
@@ -268,5 +271,10 @@ void qdr_http1_server_core_delivery_update(qdr_http1_adaptor_t      *adaptor,
                                            qdr_delivery_t           *dlv,
                                            uint64_t                  disp,
                                            bool                      settled);
+
+
+// recording of stats:
+void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_base_t *request);
+void qdr_http1_record_server_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_base_t *request);
 
 #endif // http1_private_H

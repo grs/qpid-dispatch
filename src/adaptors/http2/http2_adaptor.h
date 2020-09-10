@@ -101,6 +101,15 @@ struct qdr_http2_stream_data_t {
     bool                     full_payload_handled;
     bool                     out_msg_has_body;
     bool                     disp_updated;
+
+    //for stats:
+    char                    *method;
+    int                      request_status;
+    char                    *remote_site;
+    int                      bytes_in;
+    int                      bytes_out;
+    qd_timestamp_t           start;
+    qd_timestamp_t           stop;
 };
 
 struct qdr_http2_connection_t {
