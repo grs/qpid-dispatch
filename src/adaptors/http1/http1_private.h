@@ -39,7 +39,6 @@ typedef struct qdr_http1_response_msg_t qdr_http1_response_msg_t;
 typedef struct qdr_http1_request_t      qdr_http1_request_t;
 typedef struct qdr_http1_connection_t   qdr_http1_connection_t;
 
-
 typedef struct qdr_http1_adaptor_t {
     qdr_core_t               *core;
     qdr_protocol_adaptor_t   *adaptor;
@@ -106,6 +105,9 @@ struct qdr_http1_request_t {
     h1_codec_request_state_t *lib_rs;
     qdr_http1_connection_t   *hconn;  // parent connection
     char                     *response_addr; // request reply-to
+    char                     *site;
+    qd_timestamp_t            start;
+    qd_timestamp_t            stop;
 
     // The request message.
     //
@@ -184,6 +186,7 @@ struct qdr_http1_connection_t {
         char *host;
         char *port;
         char *address;
+        char *site;
         char *host_port;
     } cfg;
 
@@ -307,5 +310,23 @@ void qdr_http1_server_core_delivery_update(qdr_http1_adaptor_t *adaptor,
                                            qdr_delivery_t         *dlv,
                                            uint64_t                disp,
                                            bool                    settled);
+
+
+// management info retrieval:
+
+void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request, qdr_http1_response_msg_t *response);
+void qdr_http1_record_server_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request, int status, const char *reason);
+
+
+void qdra_http_request_info_get_first_CT(qdr_core_t *core, qdr_query_t *query, int offset);
+void qdra_http_request_info_get_next_CT(qdr_core_t *core, qdr_query_t *query);
+void qdra_http_request_info_get_CT(qdr_core_t          *core,
+                                   qd_iterator_t       *name,
+                                   qd_iterator_t       *identity,
+                                   qdr_query_t         *query,
+                                   const char          *qdr_http_request_info_columns[]);
+
+#define QDR_HTTP_REQUEST_INFO_COLUMN_COUNT 10
+extern const char *qdr_http_request_info_columns[QDR_HTTP_REQUEST_INFO_COLUMN_COUNT + 1];
 
 #endif // http1_private_H

@@ -72,6 +72,7 @@ static qdr_http1_connection_t *_create_server_connection(qd_http_connector_t *ct
     hconn->cfg.host = qd_strdup(bconfig->host);
     hconn->cfg.port = qd_strdup(bconfig->port);
     hconn->cfg.address = qd_strdup(bconfig->address);
+    hconn->cfg.site = qd_strdup(bconfig->site);
     hconn->cfg.host_port = qd_strdup(bconfig->host_port);
 
     // for initiating a connection to the server
@@ -512,6 +513,8 @@ static int _server_rx_response_cb(h1_codec_request_state_t *hrs,
            "[C%"PRIu64"][L%"PRIu64"] HTTP response received: status=%d phrase=%s version=%"PRIi32".%"PRIi32,
            hreq->hconn->conn_id, hreq->hconn->in_link_id, status_code, reason_phrase ? reason_phrase : "<NONE>",
            version_major, version_minor);
+    hreq->stop = qd_timer_now();
+    qdr_http1_record_server_request_info(qdr_http1_adaptor, hreq, status_code, reason_phrase);
 
     hreq->app_props = qd_compose(QD_PERFORMATIVE_APPLICATION_PROPERTIES, 0);
     qd_compose_start_map(hreq->app_props);
@@ -591,6 +594,11 @@ static int _server_rx_headers_done_cb(h1_codec_request_state_t *hrs, bool has_bo
     qd_compose_insert_string(props, h1_codec_request_state_method(hrs));
     qd_compose_insert_null(props);   // reply-to
     qd_compose_insert_ulong(props, hreq->msg_id);  // correlation-id
+    qd_compose_insert_null(props);                      // content-type
+    qd_compose_insert_null(props);                      // content-encoding
+    qd_compose_insert_null(props);                      // absolute-expiry-time
+    qd_compose_insert_null(props);                      // creation-time
+    qd_compose_insert_string(props, hconn->cfg.site);   // group-id
     qd_compose_end_list(props);
 
     qd_compose_end_map(hreq->app_props);
@@ -908,11 +916,17 @@ static qdr_http1_request_t *_create_request_context(qdr_http1_connection_t *hcon
         return 0;
     }
 
+    qd_iterator_t *group_id_itr = qd_message_field_iterator(msg, QD_FIELD_GROUP_ID);
+    char* group_id = (char*) qd_iterator_copy(group_id_itr);
+    qd_iterator_free(group_id_itr);
+
     qdr_http1_request_t *hreq = new_qdr_http1_request_t();
     ZERO(hreq);
+    hreq->start = qd_timer_now();
     hreq->hconn = hconn;
     hreq->msg_id = msg_id;
     hreq->response_addr = reply_to;
+    hreq->site = group_id;
     DEQ_INIT(hreq->out_fifo);
     DEQ_INSERT_TAIL(hconn->requests, hreq);
 

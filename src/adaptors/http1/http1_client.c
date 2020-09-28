@@ -94,6 +94,7 @@ static qdr_http1_connection_t *_create_client_connection(qd_http_lsnr_t *li)
     hconn->cfg.host = qd_strdup(li->config.host);
     hconn->cfg.port = qd_strdup(li->config.port);
     hconn->cfg.address = qd_strdup(li->config.address);
+    hconn->cfg.site = qd_strdup(li->config.site);
 
     hconn->raw_conn = pn_raw_connection();
     pn_raw_connection_set_context(hconn->raw_conn, &hconn->handler_context);
@@ -470,6 +471,7 @@ static int _client_rx_request_cb(h1_codec_request_state_t *hrs,
 
     qdr_http1_request_t *creq = new_qdr_http1_request_t();
     ZERO(creq);
+    creq->start = qd_timer_now();
     creq->msg_id = hconn->client.next_msg_id++;
     creq->lib_rs = hrs;
     creq->hconn = hconn;
@@ -581,6 +583,12 @@ static int _client_rx_headers_done_cb(h1_codec_request_state_t *hrs, bool has_bo
     qd_compose_insert_string(props, hconn->cfg.address); // to
     qd_compose_insert_string(props, h1_codec_request_state_method(hrs));  // subject
     qd_compose_insert_string(props, hconn->client.reply_to_addr);   // reply-to
+    qd_compose_insert_null(props);                      // correlation-id
+    qd_compose_insert_null(props);                      // content-type
+    qd_compose_insert_null(props);                      // content-encoding
+    qd_compose_insert_null(props);                      // absolute-expiry-time
+    qd_compose_insert_null(props);                      // creation-time
+    qd_compose_insert_string(props, hconn->cfg.site);   // group-id
 
     assert(hconn->client.reply_to_addr && strlen(hconn->client.reply_to_addr));  //remove me
     qd_log(qdr_http1_adaptor->log, QD_LOG_TRACE,
@@ -859,6 +867,11 @@ static bool _encode_response_headers(qdr_http1_request_t *hreq,
 {
     bool ok = false;
     qd_message_t *msg = qdr_delivery_message(rmsg->dlv);
+
+    qd_iterator_t *group_id_itr = qd_message_field_iterator(msg, QD_FIELD_GROUP_ID);
+    hreq->site = (char*) qd_iterator_copy(group_id_itr);
+    qd_iterator_free(group_id_itr);
+
     qd_iterator_t *app_props_iter = qd_message_field_iterator(msg, QD_FIELD_APPLICATION_PROPERTIES);
     if (app_props_iter) {
         qd_parsed_field_t *app_props = qd_parse(app_props_iter);
@@ -1066,6 +1079,8 @@ uint64_t qdr_http1_client_core_link_deliver(qdr_http1_adaptor_t    *adaptor,
     assert(rmsg && rmsg->dlv == delivery);
 
     rmsg->dispo = _encode_response_message(hreq, rmsg);
+    hreq->stop = qd_timer_now();
+    qdr_http1_record_client_request_info(adaptor, hreq, rmsg);
     if (rmsg->dispo == PN_ACCEPTED) {
         bool need_close = false;
         qd_message_set_send_complete(msg);

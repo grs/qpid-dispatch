@@ -39,6 +39,7 @@ typedef struct qd_http_bridge_config_t {
     char              *host;
     char              *port;
     char              *address;
+    char              *site;
     char              *host_port;
     qd_http_version_t  version;
 } qd_http_bridge_config_t;
