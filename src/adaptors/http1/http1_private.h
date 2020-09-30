@@ -314,8 +314,8 @@ void qdr_http1_server_core_delivery_update(qdr_http1_adaptor_t *adaptor,
 
 // management info retrieval:
 
-void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request, qdr_http1_response_msg_t *response);
-void qdr_http1_record_server_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request, int status, const char *reason);
+void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request);
+void qdr_http1_record_server_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request);
 
 
 void qdra_http_request_info_get_first_CT(qdr_core_t *core, qdr_query_t *query, int offset);
@@ -326,7 +326,7 @@ void qdra_http_request_info_get_CT(qdr_core_t          *core,
                                    qdr_query_t         *query,
                                    const char          *qdr_http_request_info_columns[]);
 
-#define QDR_HTTP_REQUEST_INFO_COLUMN_COUNT 10
+#define QDR_HTTP_REQUEST_INFO_COLUMN_COUNT 11
 extern const char *qdr_http_request_info_columns[QDR_HTTP_REQUEST_INFO_COLUMN_COUNT + 1];
 
 #endif // http1_private_H

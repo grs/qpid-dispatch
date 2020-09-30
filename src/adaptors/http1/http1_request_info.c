@@ -24,6 +24,16 @@
 #include "dispatch_private.h"
 #include <inttypes.h>
 
+typedef struct qdr_http_method_status_t  qdr_http_method_status_t;
+
+struct qdr_http_method_status_t {
+    DEQ_LINKS(qdr_http_method_status_t);
+
+    char     *key;
+    uint64_t requests;
+};
+DEQ_DECLARE(qdr_http_method_status_t, qdr_http_method_status_list_t);
+
 typedef struct qdr_http_request_info_t  qdr_http_request_info_t;
 
 struct qdr_http_request_info_t {
@@ -38,6 +48,7 @@ struct qdr_http_request_info_t {
     uint64_t  bytes_in;
     uint64_t  bytes_out;
     uint64_t  max_latency;
+    qdr_http_method_status_list_t detail;
 };
 DEQ_DECLARE(qdr_http_request_info_t, qdr_http_request_info_list_t);
 
@@ -51,6 +62,7 @@ DEQ_DECLARE(qdr_http_request_info_t, qdr_http_request_info_list_t);
 #define QDR_HTTP_REQUEST_INFO_BYTES_IN               7
 #define QDR_HTTP_REQUEST_INFO_BYTES_OUT              8
 #define QDR_HTTP_REQUEST_INFO_MAX_LATENCY            9
+#define QDR_HTTP_REQUEST_INFO_DETAIL                10
 
 
 const char * const QDR_HTTP_REQUEST_INFO_DIRECTION_IN  = "in";
@@ -67,6 +79,7 @@ const char *qdr_http_request_info_columns[] =
      "bytesIn",
      "bytesOut",
      "maxLatency",
+     "details",
      0};
 
 const char *HTTP_REQUEST_INFO_TYPE = "org.apache.qpid.dispatch.httpRequestInfo";
@@ -136,6 +149,15 @@ static void insert_column(qdr_core_t *core, qdr_http_request_info_t *record, int
 
     case QDR_HTTP_REQUEST_INFO_MAX_LATENCY:
         qd_compose_insert_uint(body, record->max_latency);
+        break;
+
+    case QDR_HTTP_REQUEST_INFO_DETAIL:
+        qd_compose_start_map(body);
+        for (qdr_http_method_status_t *item = DEQ_HEAD(record->detail); item; item = DEQ_NEXT(item)) {
+            qd_compose_insert_string(body, item->key);
+            qd_compose_insert_int(body, item->requests);
+        }
+        qd_compose_end_map(body);
         break;
 
     }
@@ -273,6 +295,27 @@ void qdra_http_request_info_get_CT(qdr_core_t          *core,
     qdr_agent_enqueue_response_CT(core, query);
 }
 
+static qdr_http_method_status_t* _new_qdr_http_method_status_t(const char *const method, int status)
+{
+    qdr_http_method_status_t* record = NEW(qdr_http_method_status_t);
+    ZERO(record);
+
+    if (status >= 600 || status < 100) {
+        status = 500;
+    }
+    size_t key_len = strlen(method) + 5;
+    record->key = malloc(key_len);
+    snprintf(record->key, key_len, "%s:%03i", method, status);
+
+    return record;
+}
+
+static void _free_qdr_http_method_status(qdr_http_method_status_t* record)
+{
+    free(record->key);
+    free(record);
+}
+
 static void _free_qdr_http_request_info(qdr_http_request_info_t* record)
 {
     if (record->key) {
@@ -287,7 +330,25 @@ static void _free_qdr_http_request_info(qdr_http_request_info_t* record)
     if (record->site) {
         free(record->site);
     }
+    for (qdr_http_method_status_t *item = DEQ_HEAD(record->detail); item; item = DEQ_NEXT(item)) {
+        _free_qdr_http_method_status(item);
+    }
     free(record);
+}
+
+static void _update_http_method_status_detail(qdr_http_method_status_list_t *detail, qdr_http_method_status_t *addition)
+{
+    bool updated = false;
+    for (qdr_http_method_status_t *item = DEQ_HEAD(*detail); item && !updated; item = DEQ_NEXT(item)) {
+        if (strcmp(item->key, addition->key) == 0) {
+            item->requests += addition->requests;
+            _free_qdr_http_method_status(addition);
+            updated = true;
+        }
+    }
+    if (!updated) {
+        DEQ_INSERT_TAIL(*detail, addition);
+    }
 }
 
 static bool _update_qdr_http_request_info(qdr_http_request_info_t* record, qdr_http_request_info_t* additions)
@@ -298,6 +359,10 @@ static bool _update_qdr_http_request_info(qdr_http_request_info_t* record, qdr_h
         record->bytes_out += additions->bytes_out;
         if (additions->max_latency > record->max_latency) {
             record->max_latency = additions->max_latency;
+        }
+        for (qdr_http_method_status_t *item = DEQ_HEAD(additions->detail); item; item = DEQ_HEAD(additions->detail)) {
+            DEQ_REMOVE_HEAD(additions->detail);
+            _update_http_method_status_detail(&record->detail, item);
         }
         return true;
     } else {
@@ -329,28 +394,11 @@ static void _add_http_request_info(qdr_core_t *core, qdr_http_request_info_t* re
     qdr_action_enqueue(core, action);
 }
 
-/*
-
-static void _del_http_request_info_CT(qdr_core_t *core, qdr_action_t *action, bool discard)
-{
-    qdr_http_request_info_t *record = (qdr_http_request_info_t*) action->args.general.context_1;
-    DEQ_REMOVE(_get_request_info()->records, record);
-    qd_log(qdr_http1_adaptor->log, QD_LOG_DEBUG, "Removed http request info %s (%i)", record->address, DEQ_SIZE(_get_request_info()->records));
-    _free_qdr_http_request_info(record);
-}
-
-static void _del_http_request_info(qdr_core_t *core, qdr_http_request_info_t* record)
-{
-    qdr_action_t *action = qdr_action(_del_http_request_info_CT, "delete_http_request_info");
-    action->args.general.context_1 = record;
-    qdr_action_enqueue(core, action);
-}
-*/
-
 static qdr_http_request_info_t* _new_qdr_http_request_info_t()
 {
     qdr_http_request_info_t* record = NEW(qdr_http_request_info_t);
     ZERO(record);
+    DEQ_INIT(record->detail);
     return record;
 }
 
@@ -368,12 +416,26 @@ static char *_record_key(char *host, char* site, bool ingress)
     return key;
 }
 
-void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request, qdr_http1_response_msg_t *response)
+static char *_get_host_from_host_port(const char *host_port)
+{
+    char *end = strchr(host_port, ':');
+    if (end == NULL) {
+        return strdup(host_port);
+    } else {
+        size_t len = end - host_port;
+        char *host = malloc(len + 1);
+        strncpy(host, host_port, len);
+        host[len] = '\0';
+        return host;
+    }
+}
+
+void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request)
 {
     qdr_http_request_info_t* record = _new_qdr_http_request_info_t();
     record->ingress = true;
     record->address = qd_strdup(request->hconn->cfg.address);
-    record->host = qd_strdup(request->hconn->client.client_ip_addr);
+    record->host = _get_host_from_host_port(request->hconn->client.client_ip_addr);
     record->site = request->site;
     record->key = _record_key(record->host, request->hconn->cfg.site ? qd_strdup(request->hconn->cfg.site) : 0, true);
     record->requests = 1;
@@ -381,22 +443,34 @@ void qdr_http1_record_client_request_info(qdr_http1_adaptor_t *adaptor, qdr_http
     record->bytes_out = request->out_http1_octets;
     record->max_latency = request->stop && request->start ? request->stop - request->start : 0;
 
+    const char *method = h1_codec_request_state_method(request->lib_rs);
+    uint32_t status = h1_codec_request_state_response_code(request->lib_rs);
+    qdr_http_method_status_t *detail = _new_qdr_http_method_status_t(method, (int) status);
+    detail->requests = 1;
+    DEQ_INSERT_TAIL(record->detail, detail);
+
     qd_log(qdr_http1_adaptor->log, QD_LOG_DEBUG, "Adding client http request info %s", record->key);
     _add_http_request_info(adaptor->core, record);
 }
 
-void qdr_http1_record_server_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request, int status, const char *reason)
+void qdr_http1_record_server_request_info(qdr_http1_adaptor_t *adaptor, qdr_http1_request_t *request)
 {
     qdr_http_request_info_t* record = _new_qdr_http_request_info_t();
     record->ingress = false;
     record->address = qd_strdup(request->hconn->cfg.address);
-    record->host = qd_strdup(request->hconn->cfg.host_port);
+    record->host = qd_strdup(request->hconn->cfg.host);
     record->site = request->site;
     record->key = _record_key(record->host, request->hconn->cfg.site ? qd_strdup(request->hconn->cfg.site) : 0, false);
     record->requests = 1;
     record->bytes_in = request->in_http1_octets;
     record->bytes_out = request->out_http1_octets;
     record->max_latency = request->stop && request->start ? request->stop - request->start : 0;
+
+    const char *method = h1_codec_request_state_method(request->lib_rs);
+    uint32_t status = h1_codec_request_state_response_code(request->lib_rs);
+    qdr_http_method_status_t *detail = _new_qdr_http_method_status_t(method, (int) status);
+    detail->requests = 1;
+    DEQ_INSERT_TAIL(record->detail, detail);
 
     qd_log(qdr_http1_adaptor->log, QD_LOG_DEBUG, "Adding server http request info %s", record->key);
     _add_http_request_info(adaptor->core, record);

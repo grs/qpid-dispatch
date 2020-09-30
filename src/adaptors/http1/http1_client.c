@@ -1080,7 +1080,7 @@ uint64_t qdr_http1_client_core_link_deliver(qdr_http1_adaptor_t    *adaptor,
 
     rmsg->dispo = _encode_response_message(hreq, rmsg);
     hreq->stop = qd_timer_now();
-    qdr_http1_record_client_request_info(adaptor, hreq, rmsg);
+    qdr_http1_record_client_request_info(adaptor, hreq);
     if (rmsg->dispo == PN_ACCEPTED) {
         bool need_close = false;
         qd_message_set_send_complete(msg);

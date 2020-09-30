@@ -514,7 +514,7 @@ static int _server_rx_response_cb(h1_codec_request_state_t *hrs,
            hreq->hconn->conn_id, hreq->hconn->in_link_id, status_code, reason_phrase ? reason_phrase : "<NONE>",
            version_major, version_minor);
     hreq->stop = qd_timer_now();
-    qdr_http1_record_server_request_info(qdr_http1_adaptor, hreq, status_code, reason_phrase);
+    qdr_http1_record_server_request_info(qdr_http1_adaptor, hreq);
 
     hreq->app_props = qd_compose(QD_PERFORMATIVE_APPLICATION_PROPERTIES, 0);
     qd_compose_start_map(hreq->app_props);
