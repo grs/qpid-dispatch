@@ -713,8 +713,6 @@ static int _server_rx_response_cb(h1_codec_request_state_t *hrs,
            "[C%"PRIu64"][L%"PRIu64"] HTTP response received: status=%d phrase=%s version=%"PRIi32".%"PRIi32,
            hconn->conn_id, hconn->in_link_id, status_code, reason_phrase ? reason_phrase : "<NONE>",
            version_major, version_minor);
-    hreq->base.stop = qd_timer_now();
-    qdr_http1_record_server_request_info(qdr_http1_adaptor, &hreq->base);
 
     _server_response_msg_t *rmsg = new__server_response_msg_t();
     ZERO(rmsg);
@@ -944,6 +942,8 @@ static void _server_request_complete_cb(h1_codec_request_state_t *hrs, bool canc
     hreq->base.lib_rs = 0;
     hreq->cancelled = hreq->cancelled || cancelled;
     hreq->codec_completed = !hreq->cancelled;
+    hreq->base.stop = qd_timer_now();
+    qdr_http1_record_server_request_info(qdr_http1_adaptor, &hreq->base);
 
     qd_log(qdr_http1_adaptor->log, QD_LOG_TRACE,
            "[C%"PRIu64"] HTTP request/response %s.", hconn->conn_id,
@@ -1089,6 +1089,7 @@ static _server_request_t *_create_request_context(qdr_http1_connection_t *hconn,
     hreq->base.msg_id = msg_id;
     hreq->base.response_addr = reply_to;
     hreq->base.site = group_id;
+    hreq->base.start = qd_timer_now();
     DEQ_INIT(hreq->out_data.fifo);
     DEQ_INIT(hreq->responses);
     DEQ_INSERT_TAIL(hconn->requests, &hreq->base);
