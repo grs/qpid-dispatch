@@ -372,6 +372,8 @@ static int on_data_chunk_recv_callback(nghttp2_session *session,
     if (!stream_data)
         return 0;
 
+    stream_data->bytes_in += len;
+
     qd_buffer_list_t buffers;
     DEQ_INIT(buffers);
     qd_buffer_list_append(&buffers, (uint8_t *)data, len);
@@ -428,6 +430,8 @@ static int snd_data_callback(nghttp2_session *session,
     qdr_http2_stream_data_t *stream_data = (qdr_http2_stream_data_t *)source->ptr;
 
     qd_log(http2_adaptor->protocol_log_source, QD_LOG_TRACE, "[C%i][S%"PRId32"] HTTP2 snd_data_callback length=%zu", conn->conn_id, stream_data->stream_id, length);
+
+    stream_data->bytes_out += length;
 
     qd_http2_buffer_t *http2_buff = qd_http2_buffer();
     DEQ_INSERT_TAIL(session_data->buffs, http2_buff);
