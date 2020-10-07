@@ -939,11 +939,11 @@ static void _server_request_complete_cb(h1_codec_request_state_t *hrs, bool canc
     _server_request_t       *hreq = (_server_request_t*) h1_codec_request_state_get_context(hrs);
     qdr_http1_connection_t *hconn = hreq->base.hconn;
 
+    hreq->base.stop = qd_timer_now();
+    qdr_http1_record_server_request_info(qdr_http1_adaptor, &hreq->base);
     hreq->base.lib_rs = 0;
     hreq->cancelled = hreq->cancelled || cancelled;
     hreq->codec_completed = !hreq->cancelled;
-    hreq->base.stop = qd_timer_now();
-    qdr_http1_record_server_request_info(qdr_http1_adaptor, &hreq->base);
 
     qd_log(qdr_http1_adaptor->log, QD_LOG_TRACE,
            "[C%"PRIu64"] HTTP request/response %s.", hconn->conn_id,
