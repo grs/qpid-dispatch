@@ -24,7 +24,7 @@
 #include <string.h>
 
 
-size_t BUFFER_SIZE     = 4096;
+size_t BUFFER_SIZE     = 1024;
 
 ALLOC_DECLARE(qd_buffer_t);
 ALLOC_DEFINE_CONFIG(qd_buffer_t, sizeof(qd_buffer_t), &BUFFER_SIZE, 0);
