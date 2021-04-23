@@ -39,7 +39,7 @@
 // by READ_BUFFERS * BUFFER_SIZE since we fetch up to READ_BUFFERs worth of
 // buffers when calling pn_raw_connection_take_read_buffers()
 //
-const uint32_t TCP_MAX_CAPACITY = 131072;
+const uint32_t TCP_MAX_CAPACITY = 131072*8;
 
 
 ALLOC_DEFINE(qd_tcp_listener_t);
@@ -89,9 +89,6 @@ struct qdr_tcp_connection_t {
     pn_raw_buffer_t         outgoing_buffs[WRITE_BUFFERS];
     int                     outgoing_buff_count;  // number of buffers with data
     int                     outgoing_buff_idx;    // first buffer with data
-
-    sys_atomic_t            q2_restart;      // signal to resume receive
-    bool                    q2_blocked;      // stop reading from raw conn
 
     DEQ_LINKS(qdr_tcp_connection_t);
 
@@ -169,33 +166,6 @@ static void grant_read_buffers(qdr_tcp_connection_t *conn)
     }
 }
 
-
-// Per-message callback to resume receiving after Q2 is unblocked on the
-// incoming link.
-// This routine must be thread safe: the thread on which it is running
-// is not an IO thread that owns the underlying pn_raw_conn.
-//
-void qdr_tcp_q2_unblocked_handler(const qd_alloc_safe_ptr_t context)
-{
-    qdr_tcp_connection_t *tc = (qdr_tcp_connection_t*)qd_alloc_deref_safe_ptr(&context);
-    if (tc == 0) {
-        // bad news.
-        assert(false);
-        return;
-    }
-
-    // prevent the tc from being deleted while running:
-    sys_mutex_lock(tc->activation_lock);
-
-    if (tc->pn_raw_conn) {
-        sys_atomic_set(&tc->q2_restart, 1);
-        pn_raw_connection_wake(tc->pn_raw_conn);
-    }
-
-    sys_mutex_unlock(tc->activation_lock);
-}
-
-
 // Fetch incoming raw incoming buffers from proton and pass them to
 // existing delivery or create a new delivery.
 // If close is pending then do not give more buffers to proton.
@@ -211,14 +181,6 @@ static int handle_incoming_impl(qdr_tcp_connection_t *conn, bool close_pending)
         if (!conn->flow_enabled) {
             qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%"PRIu64"][L%"PRIu64"] Waiting for credit to initiate message", conn->conn_id, conn->outgoing_id);
         }
-        return 0;
-    }
-
-    //
-    // Don't read from proton if in Q2 holdoff
-    //
-    if (conn->q2_blocked) {
-        qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%"PRIu64"] handle_incoming q2_blocked", conn->conn_id);
         return 0;
     }
 
@@ -266,11 +228,7 @@ static int handle_incoming_impl(qdr_tcp_connection_t *conn, bool close_pending)
     }
 
     if (conn->instream) {
-        qd_message_stream_data_append(qdr_delivery_message(conn->instream), &buffers, &conn->q2_blocked);
-        if (conn->q2_blocked) {
-            // note: unit tests grep for this log!
-            qd_log(tcp_adaptor->log_source, QD_LOG_TRACE, "[C%"PRIu64"] client link blocked on Q2 limit", conn->conn_id);
-        }
+        qd_message_stream_data_append(qdr_delivery_message(conn->instream), &buffers, 0);
         qdr_delivery_continue(tcp_adaptor->core, conn->instream, false);
         qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%"PRIu64"][L%"PRIu64"] Continuing message with %i bytes", conn->conn_id, conn->incoming_id, count);
     } else {
@@ -310,10 +268,6 @@ static int handle_incoming_impl(qdr_tcp_connection_t *conn, bool close_pending)
 
         qd_message_compose_2(msg, props, false);
         qd_compose_free(props);
-
-        // set up message q2 unblocked callback handler
-        qd_alloc_safe_ptr_t conn_sp = QD_SAFE_PTR_INIT(conn);
-        qd_message_set_q2_unblocked_handler(msg, qdr_tcp_q2_unblocked_handler, conn_sp);
 
         conn->instream = qdr_link_deliver(conn->incoming, msg, 0, false, 0, 0, 0, 0);
         qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG, "[C%"PRIu64"][L%"PRIu64"] Initiating message with %i bytes", conn->conn_id, conn->incoming_id, count);
@@ -357,7 +311,6 @@ static void free_qdr_tcp_connection(qdr_tcp_connection_t* tc)
     free(tc->reply_to);
     free(tc->remote_address);
     free(tc->global_id);
-    sys_atomic_destroy(&tc->q2_restart);
     if (tc->activate_timer) {
         qd_timer_free(tc->activate_timer);
     }
@@ -682,7 +635,6 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
     }
     case PN_RAW_CONNECTION_CLOSED_READ: {
         qd_log(log, QD_LOG_DEBUG, "[C%"PRIu64"] PN_RAW_CONNECTION_CLOSED_READ", conn->conn_id);
-        conn->q2_blocked = false;
         handle_incoming_impl(conn, true);
         sys_mutex_lock(conn->activation_lock);
         conn->raw_closed_read = true;
@@ -720,17 +672,6 @@ static void handle_connection_event(pn_event_t *e, qd_server_t *qd_server, void 
     }
     case PN_RAW_CONNECTION_WAKE: {
         qd_log(log, QD_LOG_DEBUG, "[C%"PRIu64"] PN_RAW_CONNECTION_WAKE", conn->conn_id);
-        sys_mutex_lock(conn->activation_lock);
-        if (sys_atomic_set(&conn->q2_restart, 0)) {
-            sys_mutex_unlock(conn->activation_lock);
-            // note: unit tests grep for this log!
-            qd_log(log, QD_LOG_TRACE, "[C%"PRIu64"] client link unblocked from Q2 limit", conn->conn_id);
-            conn->q2_blocked = false;
-            handle_incoming(conn);
-        }
-        else {
-            sys_mutex_unlock(conn->activation_lock);
-        }
         while (qdr_connection_process(conn->qdr_conn)) {}
         break;
     }
@@ -776,7 +717,6 @@ static qdr_tcp_connection_t *qdr_tcp_connection_ingress(qd_tcp_listener_t* liste
     tc->context.handler = &handle_connection_event;
     tc->config = listener->config;
     tc->server = listener->server;
-    sys_atomic_init(&tc->q2_restart, 0);
     tc->pn_raw_conn = pn_raw_connection();
     pn_raw_connection_set_context(tc->pn_raw_conn, tc);
     //the following call will cause a PN_RAW_CONNECTION_CONNECTED
@@ -870,7 +810,6 @@ static qdr_tcp_connection_t *qdr_tcp_connection_egress(qd_bridge_config_t *confi
     tc->context.handler = &handle_connection_event;
     tc->config = *config;
     tc->server = server;
-    sys_atomic_init(&tc->q2_restart, 0);
     tc->conn_id = qd_server_allocate_connection_id(tc->server);
 
     //
@@ -1329,8 +1268,8 @@ static void qdr_tcp_delivery_update(void *context, qdr_delivery_t *dlv, uint64_t
             if (!dstate) {
                 qd_log(tcp_adaptor->log_source, QD_LOG_ERROR,
                        "[C%"PRIu64"] BAD PN_RECEIVED - missing delivery-state!!", tc->conn_id);
-                tc->unacked_octets = 0;  // possible recovery: just clear the entire window
-                window_opened = true;
+                //tc->unacked_octets = 0;  // possible recovery: just clear the entire window
+                //window_opened = true;
             } else {
                 // note: the PN_RECEIVED is generated by the remote TCP
                 // adaptor, for simplicity we ignore the section_number since
