@@ -742,7 +742,7 @@ class TcpAdaptor(TestCase):
     # Tests run by ctest
     #
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_01_tcp_basic_connectivity(self):
+    def xtest_01_tcp_basic_connectivity(self):
         """
         Echo a series of 1-byte messages, one at a time, to prove general connectivity.
         Every listener is tried. Proves every router can forward to servers on
@@ -762,7 +762,7 @@ class TcpAdaptor(TestCase):
 
     # larger messages
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_10_tcp_INTA_INTA_100(self):
+    def xtest_10_tcp_INTA_INTA_100(self):
         name = "test_10_tcp_INTA_INTA_100"
         self.logger.log("TCP_TEST Start %s" % name)
         pairs = [self.EchoPair(self.INTA, self.INTA, sizes=[100])]
@@ -774,7 +774,7 @@ class TcpAdaptor(TestCase):
         self.logger.log("TCP_TEST Stop %s SUCCESS" % name)
 
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_11_tcp_INTA_INTA_1000(self):
+    def xtest_11_tcp_INTA_INTA_1000(self):
         name = "test_11_tcp_INTA_INTA_1000"
         self.logger.log("TCP_TEST Start %s" % name)
         pairs = [self.EchoPair(self.INTA, self.INTA, sizes=[1000])]
@@ -798,7 +798,7 @@ class TcpAdaptor(TestCase):
         self.logger.log("TCP_TEST Stop %s SUCCESS" % name)
 
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_13_tcp_EA1_EC2_500000(self):
+    def xtest_13_tcp_EA1_EC2_500000(self):
         name = "test_12_tcp_EA1_EC2_500000"
         self.logger.log("TCP_TEST Start %s" % name)
         pairs = [self.EchoPair(self.INTA, self.INTA, sizes=[500000])]
@@ -809,7 +809,7 @@ class TcpAdaptor(TestCase):
         assert result is None, "TCP_TEST Stop %s FAIL: %s" % (name, result)
 
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_20_tcp_connect_disconnect(self):
+    def xtest_20_tcp_connect_disconnect(self):
         name = "test_20_tcp_connect_disconnect"
         self.logger.log("TCP_TEST Start %s" % name)
         pairs = [self.EchoPair(self.INTA, self.INTA, sizes=[0])]
@@ -823,7 +823,7 @@ class TcpAdaptor(TestCase):
 
     # concurrent messages
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_50_concurrent(self):
+    def xtest_50_concurrent(self):
         name = "test_50_concurrent_AtoA_BtoB"
         self.logger.log("TCP_TEST Start %s" % name)
         pairs = [self.EchoPair(self.INTA, self.INTA),
@@ -837,7 +837,7 @@ class TcpAdaptor(TestCase):
 
     # Q2 holdoff
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_60_q2_holdoff(self):
+    def xtest_60_q2_holdoff(self):
         # for now, Q2 is disabled to avoid stalling TCP backpressure
         self.skipTest("Q2 is disabled on TCP adaptor")
         name = "test_60_q2_holdoff"
@@ -916,7 +916,7 @@ class TcpAdaptorManagementTest(TestCase):
         assert cls.echo_server.is_running
 
     @SkipIfNeeded(DISABLE_SELECTOR_TESTS, DISABLE_SELECTOR_REASON)
-    def test_01_mgmt(self):
+    def xtest_01_mgmt(self):
         """
         Create and delete TCP connectors and listeners
         """
