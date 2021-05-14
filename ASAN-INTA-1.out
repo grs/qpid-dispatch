@@ -1,0 +1,81 @@
+=================================================================
+==3050006==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x62d000170400 at pc 0x7fa4d55c071e bp 0x7fa4bee20dd0 sp 0x7fa4bee20578
+WRITE of size 512 at 0x62d000170400 thread T3
+    #0 0x7fa4d55c071d in __interceptor_memcpy (/lib64/libasan.so.6+0x3a71d)
+    #1 0x7fa4d4ba82b9 in copy_outgoing_buffs /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:579
+    #2 0x7fa4d4ba91e3 in handle_outgoing /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:618
+    #3 0x7fa4d4bac20b in handle_connection_event /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:810
+    #4 0x7fa4d4df4291 in handle_event_with_context /home/chug/git/qpid-dispatch/src/server.c:802
+    #5 0x7fa4d4df42d2 in do_handle_raw_connection_event /home/chug/git/qpid-dispatch/src/server.c:808
+    #6 0x7fa4d4df8893 in handle /home/chug/git/qpid-dispatch/src/server.c:1089
+    #7 0x7fa4d4df8b54 in thread_run /home/chug/git/qpid-dispatch/src/server.c:1121
+    #8 0x7fa4d4c7e96b in _thread_init /home/chug/git/qpid-dispatch/src/posix/threading.c:172
+    #9 0x7fa4d4564431 in start_thread /usr/src/debug/glibc-2.31-74-gd0c84d22b6/nptl/pthread_create.c:477
+    #10 0x7fa4d371f6d2 in __clone (/lib64/libc.so.6+0x1016d2)
+
+0x62d000170400 is located 0 bytes to the right of 32768-byte region [0x62d000168400,0x62d000170400)
+allocated by thread T4 here:
+    #0 0x7fa4d5636667 in __interceptor_malloc (/lib64/libasan.so.6+0xb0667)
+    #1 0x7fa4d4ba02de in allocate_tcp_write_buffer /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:147
+    #2 0x7fa4d4bafaee in qdr_tcp_connection_egress /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:1025
+    #3 0x7fa4d4bb7191 in qdr_tcp_deliver /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:1414
+    #4 0x7fa4d4d80326 in qdr_link_process_deliveries /home/chug/git/qpid-dispatch/src/router_core/transfer.c:178
+    #5 0x7fa4d4bb693b in qdr_tcp_push /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:1392
+    #6 0x7fa4d4cb9a83 in qdr_connection_process /home/chug/git/qpid-dispatch/src/router_core/connections.c:414
+    #7 0x7fa4d4ba0bca in on_activate /home/chug/git/qpid-dispatch/src/adaptors/tcp_adaptor.c:179
+    #8 0x7fa4d4e085be in qd_timer_visit /home/chug/git/qpid-dispatch/src/timer.c:317
+    #9 0x7fa4d4df6ecc in handle /home/chug/git/qpid-dispatch/src/server.c:1006
+    #10 0x7fa4d4df8b54 in thread_run /home/chug/git/qpid-dispatch/src/server.c:1121
+    #11 0x7fa4d4c7e96b in _thread_init /home/chug/git/qpid-dispatch/src/posix/threading.c:172
+    #12 0x7fa4d4564431 in start_thread /usr/src/debug/glibc-2.31-74-gd0c84d22b6/nptl/pthread_create.c:477
+
+Thread T3 created by T0 here:
+    #0 0x7fa4d55ddbe5 in __interceptor_pthread_create (/lib64/libasan.so.6+0x57be5)
+    #1 0x7fa4d4c7ead6 in sys_thread /home/chug/git/qpid-dispatch/src/posix/threading.c:181
+    #2 0x7fa4d4dfffbd in qd_server_run /home/chug/git/qpid-dispatch/src/server.c:1499
+    #3 0x4026f8 in main_process /home/chug/git/qpid-dispatch/router/src/main.c:115
+    #4 0x404578 in main /home/chug/git/qpid-dispatch/router/src/main.c:369
+    #5 0x7fa4d3645081 in __libc_start_main ../csu/libc-start.c:308
+
+Thread T4 created by T0 here:
+    #0 0x7fa4d55ddbe5 in __interceptor_pthread_create (/lib64/libasan.so.6+0x57be5)
+    #1 0x7fa4d4c7ead6 in sys_thread /home/chug/git/qpid-dispatch/src/posix/threading.c:181
+    #2 0x7fa4d4dfffbd in qd_server_run /home/chug/git/qpid-dispatch/src/server.c:1499
+    #3 0x4026f8 in main_process /home/chug/git/qpid-dispatch/router/src/main.c:115
+    #4 0x404578 in main /home/chug/git/qpid-dispatch/router/src/main.c:369
+    #5 0x7fa4d3645081 in __libc_start_main ../csu/libc-start.c:308
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow (/lib64/libasan.so.6+0x3a71d) in __interceptor_memcpy
+Shadow bytes around the buggy address:
+  0x0c5a80026030: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c5a80026040: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c5a80026050: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c5a80026060: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c5a80026070: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x0c5a80026080:[fa]fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c5a80026090: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c5a800260a0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c5a800260b0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c5a800260c0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c5a800260d0: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+  Shadow gap:              cc
+==3050006==ABORTING
