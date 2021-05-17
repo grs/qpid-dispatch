@@ -566,6 +566,38 @@ static bool copy_outgoing_buffs(qdr_tcp_connection_t *conn)
         //copy small buffers into large one
         size_t used = conn->outgoing_buff_idx;
         while (used < conn->outgoing_buff_count && ((conn->write_buffer.size + conn->outgoing_buffs[used].size) < conn->write_buffer.capacity)) {
+
+            // before commit 273e16f asan issues with the upcoming memcpy
+            // these seem to be corrected now
+            // probe for readability, writeability
+
+            char * src_first = conn->outgoing_buffs[used].bytes;
+            char * src_last  = src_first + conn->outgoing_buffs[used].size - 1;
+
+            char * dst_first = conn->write_buffer.bytes + conn->write_buffer.size;
+            char * dst_last  = dst_first + conn->outgoing_buffs[used].size - 1;
+
+            // probe for readability
+            char a = *src_first;
+            a     += *src_last;
+
+            // probe for writeability
+            *dst_first  = a;
+            *dst_last   = a;
+
+            // at commit 273e16f content goes
+            // running self test_12 src data must not contain 0x99
+            for (char *src_ptr = src_first; src_ptr <= src_last; src_ptr++) {
+                if (*src_ptr == (char) 0x99) {
+                    assert(false);
+                }
+            }
+
+            qd_log(tcp_adaptor->log_source, QD_LOG_CRITICAL,
+                "[C%"PRIu64"] XXXXX copy_outgoing_buffs: w_buf_address=%p, wbuf_size=%i, wbuf_offset=%i. Adding %i bytes.",
+                conn->conn_id, &conn->write_buffer, conn->write_buffer.size, conn->write_buffer.offset, conn->outgoing_buffs[used].size);
+
+
             memcpy(conn->write_buffer.bytes + conn->write_buffer.size, conn->outgoing_buffs[used].bytes, conn->outgoing_buffs[used].size);
             conn->write_buffer.size += conn->outgoing_buffs[used].size;
             qd_log(tcp_adaptor->log_source, QD_LOG_DEBUG,
